@@ -1,5 +1,5 @@
 // Typecho Publisher for flymd (ESM)
-// Provides a publish dialog, settings UI, and header button with Tauri HTTP fallback.
+// Provides a publish dialog, settings UI, and header button using Tauri HTTP.
 
 const LS_KEY = 'flymd:typecho-publisher:settings'
 
@@ -123,27 +123,35 @@ function rebuildDoc(fm, body) {
   return `---\n${writeYaml(fm)}\n---\n\n${body}`
 }
 
-const tauriHttpCache = { tried: false, fetch: null, Body: null, ResponseType: null }
+const httpState = { available: null, checking: null, error: null }
 
-function getTauriHttpClient() {
-  if (tauriHttpCache.tried) {
-    return tauriHttpCache.fetch ? tauriHttpCache : null
+async function ensureHttpAvailable(ctx, { silent = false } = {}) {
+  if (httpState.available === true) return true
+  if (!httpState.checking) {
+    httpState.checking = (async () => {
+      try {
+        if (ctx?.http?.available) {
+          const ok = await ctx.http.available()
+          httpState.available = !!ok
+          if (httpState.available) httpState.error = null
+        } else {
+          httpState.available = !!ctx?.http?.fetch
+          if (!httpState.available) httpState.error = new Error('ctx.http.fetch 不可用')
+        }
+      } catch (e) {
+        httpState.available = false
+        httpState.error = e
+      } finally {
+        httpState.checking = null
+      }
+      return httpState.available
+    })()
   }
-  tauriHttpCache.tried = true
-  try {
-    const tauri = globalThis?.__TAURI__ || globalThis?.tauri
-    const http = tauri?.http
-    if (http?.fetch) {
-      tauriHttpCache.fetch = http.fetch
-      tauriHttpCache.Body = http.Body
-      tauriHttpCache.ResponseType = http.ResponseType
-      return tauriHttpCache
-    }
-  } catch {}
-  tauriHttpCache.fetch = null
-  tauriHttpCache.Body = null
-  tauriHttpCache.ResponseType = null
-  return null
+  const result = await httpState.checking
+  if (!result && !silent) {
+    ctx?.ui?.notice?.('Tauri HTTP 不可用，请在 flymd 中启用 @tauri-apps/plugin-http', 'err', 4000)
+  }
+  return !!result
 }
 
 function responseOk(res) {
@@ -265,56 +273,23 @@ function buildProxiedUrl(endpoint, proxyUrl) {
 
 async function xmlRpcPost(ctx, endpoint, xml, proxyUrl) {
   const url = buildProxiedUrl(endpoint, proxyUrl)
-  let lastError = null
-
-  const tauriClient = getTauriHttpClient()
-  if (tauriClient?.fetch) {
-    try {
-      const options = {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/xml' },
-        body: tauriClient.Body?.text ? tauriClient.Body.text(xml) : xml,
-      }
-      if (tauriClient.ResponseType?.Text !== undefined) {
-        options.responseType = tauriClient.ResponseType.Text
-      }
-      const resp = await tauriClient.fetch(url, options)
-      const text = await readResponseText(resp)
-      if (!responseOk(resp)) throw new Error(`HTTP ${resp?.status ?? 'ERR'}: ${text.slice(0, 200)}`)
-      return xmlParseResponse(text)
-    } catch (err) {
-      lastError = err
-    }
+  const http = ctx?.http
+  const available = await ensureHttpAvailable(ctx)
+  if (!available || !http?.fetch) {
+    throw new Error('Tauri HTTP 不可用，无法完成请求')
   }
-
-  if (ctx?.http?.fetch) {
-    try {
-      const options = {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/xml' },
-        body: xml,
-      }
-      if (ctx.http.Body?.text && ctx.http.ResponseType?.Text !== undefined) {
-        options.body = ctx.http.Body.text(xml)
-        options.responseType = ctx.http.ResponseType.Text
-      }
-      const resp = await ctx.http.fetch(url, options)
-      const text = await readResponseText(resp)
-      if (!responseOk(resp)) throw new Error(`HTTP ${resp?.status ?? 'ERR'}: ${text.slice(0, 200)}`)
-      return xmlParseResponse(text)
-    } catch (err) {
-      lastError = err
-    }
+  const options = {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/xml' },
+    body: http.Body?.text ? http.Body.text(xml) : xml,
   }
-
-  try {
-    const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/xml' }, body: xml })
-    const text = await resp.text()
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${text.slice(0, 200)}`)
-    return xmlParseResponse(text)
-  } catch (err) {
-    throw lastError || err
+  if (http.ResponseType?.Text !== undefined && options.responseType === undefined) {
+    options.responseType = http.ResponseType.Text
   }
+  const resp = await http.fetch(url, options)
+  const text = await readResponseText(resp)
+  if (!responseOk(resp)) throw new Error(`HTTP ${resp?.status ?? 'ERR'}: ${text.slice(0, 200)}`)
+  return xmlParseResponse(text)
 }
 
 function parseListInput(s) {
@@ -364,7 +339,7 @@ function ensureHeadbar() {
   return host
 }
 
-function addHeaderButton({ label, title, onClick, primary = false }) {
+function addHeaderButton({ id, label, title, onClick, primary = false }) {
   let disposed = false
   let button = null
   let host = null
@@ -373,11 +348,18 @@ function addHeaderButton({ label, title, onClick, primary = false }) {
     if (disposed) return true
     host = ensureHeadbar()
     if (!host) return false
+    if (id) {
+      const dup = host.querySelector(`[data-tp-fly-id="${id}"]`)
+      if (dup) {
+        try { dup.remove() } catch {}
+      }
+    }
     button = document.createElement('button')
     button.type = 'button'
     button.className = 'tp-fly-head-btn' + (primary ? ' primary' : '')
     button.textContent = label
     if (title) button.title = title
+    if (id) button.dataset.tpFlyId = id
     button.addEventListener('click', (ev) => {
       ev.preventDefault()
       ev.stopPropagation()
@@ -479,6 +461,8 @@ export async function openSettings(ctx) {
 
     btnTest.addEventListener('click', async () => {
       try {
+        const ready = await ensureHttpAvailable(ctx)
+        if (!ready) return
         const endpoint = body.querySelector('#tp-endpoint').value.trim()
         const proxy = body.querySelector('#tp-proxy').value.trim()
         if (!endpoint) { alert('请填写接口 URL'); return }
@@ -499,6 +483,7 @@ function toLocalDateTimeString(d) {
 
 async function openPublishDialog(ctx) {
   const settings = Object.assign({ endpoint: '', proxyUrl: '', username: '', password: '', blogId: '0', useCurrentTime: true, publishTimeOffset: 0 }, await loadSettings(ctx) || {})
+  if (!await ensureHttpAvailable(ctx)) return
   if (!settings.endpoint || !settings.username || !settings.password) {
     const go = await ctx.ui?.confirm?.('尚未配置 Typecho 参数，是否现在设置？')
     if (go) return openSettings(ctx)
@@ -616,6 +601,7 @@ function cleanupDisposers() {
 export async function activate(ctx) {
   cleanupDisposers()
   ensureStyle()
+  await ensureHttpAvailable(ctx, { silent: false })
   const openPublish = () => openPublishDialog(ctx)
   const openSettingsDialog = () => openSettings(ctx)
 
@@ -634,6 +620,7 @@ export async function activate(ctx) {
   if (typeof menuSettings === 'function') registerDisposer(menuSettings)
 
   registerDisposer(addHeaderButton({
+    id: 'tp-fly-typecho-publish',
     label: 'Typecho 发布',
     title: '发布当前文档到 Typecho',
     primary: true,
@@ -643,4 +630,7 @@ export async function activate(ctx) {
 
 export function deactivate() {
   cleanupDisposers()
+  httpState.available = null
+  httpState.checking = null
+  httpState.error = null
 }
