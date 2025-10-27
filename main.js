@@ -1,393 +1,1 @@
-// Typecho Publisher for flymd (ESM)
-// Adds settings UI and a publish dialog; prefers host http API to avoid CORS.
-
-const LS_KEY = 'flymd:typecho-publisher:settings'
-async function loadSettings(ctx) {
-  try { if (ctx?.storage?.get) { const v = await ctx.storage.get('settings'); if (v && typeof v === 'object') return v } } catch {}
-  try { return JSON.parse(localStorage.getItem(LS_KEY) || '{}') || {} } catch { return {} }
-}
-async function saveSettings(ctx, s) {
-  try { if (ctx?.storage?.set) { await ctx.storage.set('settings', s); return } } catch {}
-  try { localStorage.setItem(LS_KEY, JSON.stringify(s)) } catch {}
-}
-
-function pad(n) { return n < 10 ? '0' + n : '' + n }
-function iso8601(d) {
-  return (
-    d.getFullYear() +
-    pad(d.getMonth() + 1) +
-    pad(d.getDate()) + 'T' +
-    pad(d.getHours()) + ':' +
-    pad(d.getMinutes()) + ':' +
-    pad(d.getSeconds())
-  )
-}
-
-// Very small YAML frontmatter parser/writer (limited cases; good enough for typical posts)
-function parseFrontmatter(text) {
-  const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/)
-  if (!m) return { data: {}, body: text, had: false }
-  const yaml = m[1]
-  const body = text.slice(m[0].length)
-  const lines = yaml.split(/\r?\n/)
-  const data = {}
-  let curKey = null
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i]
-    const m2 = line.match(/^([A-Za-z0-9_\-]+):\s*(.*)$/)
-    if (m2) {
-      const k = m2[1]
-      let v = m2[2]
-      if (v === '' || v === null || v === undefined) { data[k] = ''; curKey = k; continue }
-      if (/^(true|false)$/i.test(v)) { data[k] = /^true$/i.test(v); curKey = null; continue }
-      if (/^\[.*\]$/.test(v)) {
-        const inner = v.slice(1, -1).trim();
-        data[k] = inner ? inner.split(',').map(s => s.trim()).filter(Boolean) : []
-        curKey = null; continue
-      }
-      if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
-        v = v.slice(1, -1)
-      }
-      data[k] = v
-      curKey = null
-      continue
-    }
-    const mList = line.match(/^\s*-\s*(.+)$/)
-    if (mList && curKey) {
-      if (!Array.isArray(data[curKey])) data[curKey] = []
-      data[curKey].push(mList[1])
-      continue
-    }
-    if (/^\S/.test(line)) curKey = null
-  }
-  return { data, body, had: true }
-}
-
-function needsQuote(s) { return /[:#\-?&*!\[\]{},>|'%@`]/.test(s) || /\s/.test(s) }
-function writeYaml(data) {
-  const out = []
-  const pushKV = (k, v) => {
-    if (Array.isArray(v)) {
-      out.push(`${k}:`)
-      for (const it of v) {
-        let val = String(it)
-        if (needsQuote(val)) val = '"' + val.replace(/"/g, '\\"') + '"'
-        out.push(`  - ${val}`)
-      }
-    } else if (typeof v === 'boolean') {
-      out.push(`${k}: ${v ? 'true' : 'false'}`)
-    } else if (v === null || v === undefined) {
-      out.push(`${k}:`)
-    } else {
-      let val = String(v)
-      if (needsQuote(val)) val = '"' + val.replace(/"/g, '\\"') + '"'
-      out.push(`${k}: ${val}`)
-    }
-  }
-  const keys = Object.keys(data)
-  for (const k of keys) pushKV(k, data[k])
-  return out.join('\n')
-}
-
-function rebuildDoc(fm, body) {
-  const y = writeYaml(fm)
-  return `---\n${y}\n---\n\n${body}`
-}
-
-// XML-RPC minimal encoder/decoder
-function xmlEscape(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;').replace(/'/g, '&#39;') }
-function xmlEncodeValue(v) {
-  if (v === null || v === undefined) return '<nil/>'
-  if (Array.isArray(v)) return '<array><data>' + v.map(x => `<value>${xmlEncodeValue(x)}</value>`).join('') + '</data></array>'
-  if (v instanceof Date) return `<dateTime.iso8601>${iso8601(v)}</dateTime.iso8601>`
-  const t = typeof v
-  if (t === 'boolean') return `<boolean>${v ? 1 : 0}</boolean>`
-  if (t === 'number') return Number.isInteger(v) ? `<int>${v}</int>` : `<double>${v}</double>`
-  if (t === 'object') return '<struct>' + Object.entries(v).map(([k, val]) => `<member><name>${xmlEscape(k)}</name><value>${xmlEncodeValue(val)}</value></member>`).join('') + '</struct>'
-  return `<string>${xmlEscape(String(v))}</string>`
-}
-function xmlBuildCall(method, params) {
-  return `<?xml version="1.0"?><methodCall><methodName>${xmlEscape(method)}</methodName><params>` + params.map(p => `<param><value>${xmlEncodeValue(p)}</value></param>`).join('') + `</params></methodCall>`
-}
-function xmlParseResponse(text) {
-  const doc = new DOMParser().parseFromString(text, 'text/xml')
-  const fault = doc.getElementsByTagName('fault')[0]
-  const parseVal = (node) => {
-    if (!node) return null
-    const name = node.nodeName
-    if (name === 'value') { return node.children.length ? parseVal(node.children[0]) : (node.textContent ?? '') }
-    if (['string','i4','int','double','boolean','dateTime.iso8601'].includes(name)) {
-      const s = (node.textContent || '').trim()
-      if (name === 'boolean') return s === '1'
-      if (name === 'int' || name === 'i4') return parseInt(s, 10)
-      if (name === 'double') return Number(s)
-      return s
-    }
-    if (name === 'struct') {
-      const obj = {}
-      const members = node.getElementsByTagName('member')
-      for (let i = 0; i < members.length; i++) {
-        const m = members[i]
-        const key = (m.getElementsByTagName('name')[0]?.textContent) || ''
-        const val = parseVal(m.getElementsByTagName('value')[0])
-        obj[key] = val
-      }
-      return obj
-    }
-    if (name === 'array') {
-      const dataEl = node.getElementsByTagName('data')[0]
-      if (!dataEl) return []
-      const arr = []
-      for (let i = 0; i < dataEl.children.length; i++) {
-        if (dataEl.children[i].nodeName === 'value') arr.push(parseVal(dataEl.children[i]))
-      }
-      return arr
-    }
-    return node.textContent ?? ''
-  }
-  if (fault) {
-    const v = fault.getElementsByTagName('value')[0]
-    const obj = parseVal(v)
-    const msg = (obj && (obj.faultString || obj['faultString'])) || 'XML-RPC 错误'
-    const code = (obj && (obj.faultCode || obj['faultCode'])) || -1
-    const err = new Error(`XML-RPC 错误 ${code}: ${msg}`)
-    err.code = code
-    throw err
-  }
-  const params = doc.getElementsByTagName('params')[0]
-  if (!params) return null
-  const first = params.getElementsByTagName('param')[0]
-  if (!first) return null
-  const value = first.getElementsByTagName('value')[0]
-  return parseVal(value)
-}
-
-function buildProxiedUrl(endpoint, proxyUrl) {
-  if (!proxyUrl) return endpoint
-  try {
-    if (proxyUrl.includes('{target}')) return proxyUrl.replace('{target}', encodeURIComponent(endpoint))
-    if (proxyUrl.includes('?')) return proxyUrl + '&target=' + encodeURIComponent(endpoint)
-    if (proxyUrl.endsWith('/')) return proxyUrl + encodeURIComponent(endpoint)
-    return proxyUrl + '?target=' + encodeURIComponent(endpoint)
-  } catch { return endpoint }
-}
-
-async function xmlRpcPost(ctx, endpoint, xml, proxyUrl) {
-  const url = buildProxiedUrl(endpoint, proxyUrl)
-  // Prefer host http (tauri-http) to bypass CORS; fallback to fetch
-  try {
-    if (ctx?.http?.fetch) {
-      const r = await ctx.http.fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/xml' }, body: xml })
-      const txt = await r.text()
-      if (!r.ok) throw new Error(`HTTP ${r.status}: ${txt.slice(0, 200)}`)
-      return xmlParseResponse(txt)
-    }
-  } catch (e) {
-    // fallthrough to fetch
-  }
-  const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/xml' }, body: xml })
-  const text = await resp.text()
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${text.slice(0, 200)}`)
-  return xmlParseResponse(text)
-}
-
-function parseListInput(s) { return (s || '').split(',').map(x => x.trim()).filter(Boolean) }
-
-// ========== UI Helpers ==========
-function ensureStyle() {
-  if (document.getElementById('tp-fly-style')) return
-  const css = `
-  .tp-fly-overlay{position:fixed;inset:0;background:rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;z-index:90000}
-  .tp-fly-hidden{display:none}
-  .tp-fly-dialog{width:560px;max-width:calc(100% - 40px);background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:12px;box-shadow:0 12px 36px rgba(0,0,0,.2);}
-  .tp-fly-header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--border);font-weight:600;font-size:14px}
-  .tp-fly-body{padding:12px 16px;max-height:65vh;overflow:auto}
-  .tp-fly-grid{display:grid;grid-template-columns:140px 1fr;gap:10px;align-items:center}
-  .tp-fly-grid label{color:var(--muted);font-size:12px}
-  .tp-fly-grid input[type="text"],.tp-fly-grid input[type="password"],.tp-fly-grid input[type="url"],.tp-fly-grid input[type="datetime-local"]{width:100%;padding:8px 10px;border:1px solid var(--border);background:var(--bg);color:var(--fg);border-radius:8px;outline:none;font-size:13px;min-width:0;box-sizing:border-box}
-  .tp-fly-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:12px}
-  .tp-fly-btn{cursor:pointer;border:1px solid var(--border);background:rgba(127,127,127,.08);color:var(--fg);border-radius:8px;padding:6px 12px;font-size:13px}
-  .tp-fly-btn.primary{border-color:#2563eb;background:#2563eb;color:#fff}
-  .tp-fly-rowfull{grid-column:1/-1;color:var(--muted);font-size:12px}
-  `
-  const style = document.createElement('style')
-  style.id = 'tp-fly-style'
-  style.textContent = css
-  document.head.appendChild(style)
-}
-
-function openOverlay(title, contentBuilder) {
-  ensureStyle()
-  const overlay = document.createElement('div')
-  overlay.className = 'tp-fly-overlay'
-  const dialog = document.createElement('div')
-  dialog.className = 'tp-fly-dialog'
-  dialog.innerHTML = `<div class="tp-fly-header"><div>${title}</div><button class="tp-fly-btn" id="tp-close">×</button></div><div class="tp-fly-body"></div>`
-  document.body.appendChild(overlay)
-  overlay.appendChild(dialog)
-  const body = dialog.querySelector('.tp-fly-body')
-  const close = () => { try { overlay.remove() } catch {} }
-  dialog.querySelector('#tp-close').addEventListener('click', close)
-  overlay.addEventListener('click', (e) => { if (e.target === overlay) close() })
-  contentBuilder(body, close)
-  return { overlay, dialog, body, close }
-}
-
-// ========== Settings UI ==========
-export async function openSettings(ctx) {
-  const s = Object.assign({ endpoint:'', proxyUrl:'', username:'', password:'', blogId:'0', useCurrentTime:true, publishTimeOffset:0 }, await loadSettings(ctx) || {})
-  openOverlay('Typecho 发布器设置', (body, close) => {
-    const wrap = document.createElement('div')
-    wrap.className = 'tp-fly-grid'
-    wrap.innerHTML = `
-      <label>接口 URL</label><input id="tp-endpoint" type="url" placeholder="https://your-site.com/xmlrpc.php" value="${s.endpoint || ''}">
-      <label>用户名</label><input id="tp-username" type="text" value="${s.username || ''}">
-      <label>密码</label><input id="tp-password" type="password" value="${s.password || ''}">
-      <label>默认博客ID</label><input id="tp-blogid" type="text" value="${s.blogId || '0'}">
-      <label>CORS 代理</label><input id="tp-proxy" type="url" placeholder="可含 {target}" value="${s.proxyUrl || ''}">
-      <div class="tp-fly-rowfull">建议优先使用桌面环境（内置原生网络层）避免 CORS；如需浏览器内使用，请配置自建代理。</div>
-      <label>使用当前时间</label><input id="tp-usecur" type="checkbox" ${s.useCurrentTime ? 'checked' : ''}>
-      <label>发布时间偏移(小时)</label><input id="tp-offset" type="text" value="${s.publishTimeOffset || 0}">
-    `
-    body.appendChild(wrap)
-    const actions = document.createElement('div')
-    actions.className = 'tp-fly-actions'
-    const btnTest = document.createElement('button')
-    btnTest.className = 'tp-fly-btn'
-    btnTest.textContent = '测试连接'
-    const btnSave = document.createElement('button')
-    btnSave.className = 'tp-fly-btn primary'
-    btnSave.textContent = '保存'
-    const btnCancel = document.createElement('button')
-    btnCancel.className = 'tp-fly-btn'
-    btnCancel.textContent = '取消'
-    actions.appendChild(btnTest); actions.appendChild(btnSave); actions.appendChild(btnCancel)
-    body.appendChild(actions)
-
-    btnCancel.addEventListener('click', () => close())
-    btnSave.addEventListener('click', async () => {
-      const ns = {
-        endpoint: body.querySelector('#tp-endpoint').value.trim(),
-        username: body.querySelector('#tp-username').value.trim(),
-        password: body.querySelector('#tp-password').value,
-        blogId: body.querySelector('#tp-blogid').value.trim() || '0',
-        proxyUrl: body.querySelector('#tp-proxy').value.trim(),
-        useCurrentTime: !!body.querySelector('#tp-usecur').checked,
-        publishTimeOffset: parseFloat(body.querySelector('#tp-offset').value) || 0,
-      }
-      await saveSettings(ctx, ns)
-      try { ctx.ui?.notice?.('设置已保存', 'ok', 1500) } catch {}
-      close()
-    })
-    btnTest.addEventListener('click', async () => {
-      try {
-        const ep = body.querySelector('#tp-endpoint').value.trim()
-        const proxy = body.querySelector('#tp-proxy').value.trim()
-        if (!ep) { alert('请填写接口 URL'); return }
-        const xml = xmlBuildCall('system.listMethods', [])
-        await xmlRpcPost(ctx, ep, xml, proxy)
-        alert('连接正常')
-      } catch (e) { alert('连接失败: ' + (e?.message || e)) }
-    })
-  })
-}
-
-// ========== Publish Dialog ==========
-function toLocalDTStr(d) { const p = (n)=>String(n).padStart(2,'0'); return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}` }
-
-async function openPublishDialog(ctx) {
-  const settings = Object.assign({ endpoint:'', proxyUrl:'', username:'', password:'', blogId:'0', useCurrentTime:true, publishTimeOffset:0 }, await loadSettings(ctx) || {})
-  if (!settings.endpoint || !settings.username || !settings.password) {
-    const go = await ctx.ui?.confirm?.('尚未配置 Typecho 参数，是否现在设置？')
-    if (go) return openSettings(ctx)
-    return
-  }
-  const raw = ctx.getEditorValue()
-  const { data: fm, body } = parseFrontmatter(raw)
-  const K = { title:'title', slug:'slug', tags:'tags', categories:'categories', draft:'draft', cid:'cid', dateCreated:'dateCreated' }
-  const preset = {
-    title: (fm[K.title] || '').toString() || '未命名文档',
-    slug: (fm[K.slug] || '').toString(),
-    tags: Array.isArray(fm[K.tags]) ? fm[K.tags] : parseListInput(fm[K.tags] || ''),
-    categories: Array.isArray(fm[K.categories]) ? fm[K.categories] : parseListInput(fm[K.categories] || ''),
-    draft: !!fm[K.draft],
-    dateCreated: fm[K.dateCreated] ? new Date(String(fm[K.dateCreated])) : new Date(),
-    cid: fm[K.cid] ? String(fm[K.cid]) : ''
-  }
-  const initDate = settings.useCurrentTime ? new Date() : (preset.dateCreated || new Date())
-
-  openOverlay('发布到 Typecho', (bodyEl, close) => {
-    const wrap = document.createElement('div')
-    wrap.className = 'tp-fly-grid'
-    wrap.innerHTML = `
-      <label>标题</label><input id="tp-title" type="text" value="${preset.title}">
-      <label>Slug</label><input id="tp-slug" type="text" placeholder="可留空" value="${preset.slug || ''}">
-      <label>标签</label><input id="tp-tags" type="text" placeholder="逗号分隔" value="${preset.tags.join(', ')}">
-      <label>分类</label><input id="tp-cats" type="text" placeholder="逗号分隔，至少 1 个" value="${preset.categories.join(', ')}">
-      <label>草稿</label><input id="tp-draft" type="checkbox" ${preset.draft ? 'checked' : ''}>
-      <label>发布时间</label><input id="tp-date" type="datetime-local" value="${toLocalDTStr(initDate)}">
-      <div class="tp-fly-rowfull">将使用设置中的时间偏移: ${settings.publishTimeOffset || 0} 小时</div>
-    `
-    bodyEl.appendChild(wrap)
-    const actions = document.createElement('div')
-    actions.className = 'tp-fly-actions'
-    const btnCancel = document.createElement('button')
-    btnCancel.className = 'tp-fly-btn'
-    btnCancel.textContent = '取消'
-    const btnOk = document.createElement('button')
-    btnOk.className = 'tp-fly-btn primary'
-    btnOk.textContent = '发布'
-    actions.appendChild(btnCancel); actions.appendChild(btnOk)
-    bodyEl.appendChild(actions)
-    btnCancel.addEventListener('click', () => close())
-    btnOk.addEventListener('click', async () => {
-      const title = bodyEl.querySelector('#tp-title').value.trim() || '未命名文档'
-      let slug = bodyEl.querySelector('#tp-slug').value.trim()
-      const tags = parseListInput(bodyEl.querySelector('#tp-tags').value)
-      const cats = parseListInput(bodyEl.querySelector('#tp-cats').value)
-      const draft = !!bodyEl.querySelector('#tp-draft').checked
-      if (cats.length === 0) { alert('分类不能为空'); return }
-      let dt = new Date(String(bodyEl.querySelector('#tp-date').value))
-      if (!(dt instanceof Date) || isNaN(dt.getTime())) dt = new Date()
-      if (settings.publishTimeOffset) dt = new Date(dt.getTime() + settings.publishTimeOffset * 3600 * 1000)
-
-      try {
-        const postStruct = { title, description: body, mt_keywords: tags.join(','), categories: cats, post_type: 'post', wp_slug: slug || '', mt_allow_comments: 1, dateCreated: dt }
-        const hasCid = !!preset.cid
-        const method = hasCid ? 'metaWeblog.editPost' : 'metaWeblog.newPost'
-        const params = hasCid
-          ? [ String(preset.cid), settings.username, settings.password, postStruct, !draft ]
-          : [ String(settings.blogId || '0'), settings.username, settings.password, postStruct, !draft ]
-        const xml = xmlBuildCall(method, params)
-        const result = await xmlRpcPost(ctx, settings.endpoint, xml, settings.proxyUrl)
-
-        const updated = Object.assign({}, fm)
-        updated['title'] = title
-        updated['tags'] = tags
-        updated['categories'] = cats
-        updated['draft'] = draft
-        updated['dateCreated'] = iso8601(dt)
-        if (!hasCid) {
-          const newCid = String(result)
-          updated['cid'] = newCid
-          if (!slug) slug = newCid
-        }
-        updated['slug'] = slug
-        const newDoc = rebuildDoc(updated, body)
-        ctx.setEditorValue(newDoc)
-        try { ctx.ui?.notice?.(hasCid ? '更新成功' : '发布成功', 'ok', 1800) } catch {}
-        close()
-      } catch (e) {
-        console.error(e)
-        alert('发布失败: ' + (e?.message || e))
-      }
-    })
-  })
-}
-
-export async function activate(ctx) {
-  // Add menu entry to open the publish dialog
-  ctx.addMenuItem({ label: '发布到 Typecho', title: '将当前文档发布到 Typecho (XML-RPC)', onClick: async () => { await openPublishDialog(ctx) } })
-}
-
-export function deactivate() {}
+﻿⼯吠灹捥潨倠扵楬桳牥映牯映祬摭⠠卅⥍਍⼯䄠摤⁳敳瑴湩獧唠⁉湡⁤⁡異汢獩⁨楤污杯※牰晥牥⁳潨瑳栠瑴⁰偁⁉潴愠潶摩䌠剏⹓਍਍潣獮⁴卌䭟奅㴠✠汦浹㩤祴数档ⵯ異汢獩敨㩲敳瑴湩獧ധ愊祳据映湵瑣潩⁮潬摡敓瑴湩獧挨硴 ൻ 琠祲笠椠⁦挨硴⸿瑳牯条㽥朮瑥 ⁻潣獮⁴⁶‽睡楡⁴瑣⹸瑳牯条⹥敧⡴猧瑥楴杮❳㬩椠⁦瘨☠…祴数景瘠㴠㴽✠扯敪瑣⤧爠瑥牵⁮⁶⁽⁽慣捴⁨絻਍†牴⁹⁻敲畴湲䨠体⹎慰獲⡥潬慣卬潴慲敧朮瑥瑉浥䰨当䕋⥙簠⁼笧❽ 籼笠⁽⁽慣捴⁨⁻敲畴湲笠⁽ൽ紊਍獡湹⁣畦据楴湯猠癡卥瑥楴杮⡳瑣ⱸ猠 ൻ 琠祲笠椠⁦挨硴⸿瑳牯条㽥献瑥 ⁻睡楡⁴瑣⹸瑳牯条⹥敳⡴猧瑥楴杮❳‬⥳※敲畴湲素素挠瑡档笠ൽ 琠祲笠氠捯污瑓牯条⹥敳䥴整⡭卌䭟奅‬半乏献牴湩楧祦猨⤩素挠瑡档笠ൽ紊਍਍畦据楴湯瀠摡渨 ⁻敲畴湲渠㰠ㄠ‰‿〧‧‫⁮›✧⬠渠素਍畦据楴湯椠潳㘸㄰搨 ൻ 爠瑥牵⁮ന †搠朮瑥畆汬教牡⤨⬠਍††慰⡤⹤敧䵴湯桴⤨⬠ㄠ ഫ †瀠摡搨朮瑥慄整⤨ ‫吧‧ഫ †瀠摡搨朮瑥潈牵⡳⤩⬠✠✺⬠਍††慰⡤⹤敧䵴湩瑵獥⤨ ‫㨧‧ഫ †瀠摡搨朮瑥敓潣摮⡳⤩਍†ഩ紊਍਍⼯嘠牥⁹浳污⁬䅙䱍映潲瑮慭瑴牥瀠牡敳⽲牷瑩牥⠠楬業整⁤慣敳㭳朠潯⁤湥畯桧映牯琠灹捩污瀠獯獴ഩ昊湵瑣潩⁮慰獲䙥潲瑮慭瑴牥琨硥⥴笠਍†潣獮⁴⁭‽整瑸洮瑡档⼨ⵞⴭ牜尿⡮屛屳嵓㼪尩㽲湜ⴭ尭㽲湜⼿ഩ 椠⁦ℨ⥭爠瑥牵⁮⁻慤慴›絻‬潢祤›整瑸‬慨㩤映污敳素਍†潣獮⁴慹汭㴠洠ㅛ൝ 挠湯瑳戠摯⁹‽整瑸献楬散洨せ⹝敬杮桴ഩ 挠湯瑳氠湩獥㴠礠浡⹬灳楬⡴尯㽲湜⤯਍†潣獮⁴慤慴㴠笠ൽ 氠瑥挠牵敋⁹‽畮汬਍†潦⁲氨瑥椠㴠〠※⁩‼楬敮⹳敬杮桴※⭩⤫笠਍††潣獮⁴楬敮㴠氠湩獥楛൝ †挠湯瑳洠′‽楬敮洮瑡档⼨⡞䅛娭ⵡぺ㤭屟崭⤫尺⩳⸨⤪⼤ഩ †椠⁦洨⤲笠਍†††潣獮⁴⁫‽㉭ㅛ൝ ††氠瑥瘠㴠洠嬲崲਍†††晩⠠⁶㴽‽✧簠⁼⁶㴽‽畮汬簠⁼⁶㴽‽湵敤楦敮⥤笠搠瑡孡嵫㴠✠㬧挠牵敋⁹‽㭫挠湯楴畮⁥ൽ ††椠⁦⼨⡞牴敵晼污敳␩椯琮獥⡴⥶ ⁻慤慴歛⁝‽帯牴敵⼤⹩整瑳瘨㬩挠牵敋⁹‽畮汬※潣瑮湩敵素਍†††晩⠠帯孜⨮嵜⼤琮獥⡴⥶ ൻ †††挠湯瑳椠湮牥㴠瘠献楬散ㄨ‬ㄭ⸩牴浩⤨഻ †††搠瑡孡嵫㴠椠湮牥㼠椠湮牥献汰瑩✨✬⸩慭⡰⁳㸽猠琮楲⡭⤩昮汩整⡲潂汯慥⥮㨠嬠൝ †††挠牵敋⁹‽畮汬※潣瑮湩敵਍†††ൽ ††椠⁦⠨⹶瑳牡獴楗桴✨✢ ☦瘠攮摮坳瑩⡨∧⤧ 籼⠠⹶瑳牡獴楗桴∨∧ ☦瘠攮摮坳瑩⡨✢⤢⤩笠਍††††⁶‽⹶汳捩⡥ⰱⴠ⤱਍†††ൽ ††搠瑡孡嵫㴠瘠਍†††畣䭲祥㴠渠汵൬ ††挠湯楴畮൥ †素਍††潣獮⁴䱭獩⁴‽楬敮洮瑡档⼨属⩳尭⩳⸨⤫⼤ഩ †椠⁦洨楌瑳☠…畣䭲祥 ൻ ††椠⁦ℨ牁慲⹹獩牁慲⡹慤慴捛牵敋嵹⤩搠瑡孡畣䭲祥⁝‽嵛਍†††慤慴捛牵敋嵹瀮獵⡨䱭獩孴崱ഩ ††挠湯楴畮൥ †素਍††晩⠠帯卜ⸯ整瑳氨湩⥥ 畣䭲祥㴠渠汵൬ 素਍†敲畴湲笠搠瑡ⱡ戠摯ⱹ栠摡›牴敵素਍ൽഊ昊湵瑣潩⁮敮摥关潵整猨 ⁻敲畴湲⼠㩛尣㼭⨦尡屛筝ⱽ簾┧恀⽝琮獥⡴⥳簠⁼尯⽳琮獥⡴⥳素਍畦据楴湯眠楲整慙汭搨瑡⥡笠਍†潣獮⁴畯⁴‽嵛਍†潣獮⁴異桳噋㴠⠠Ⱬ瘠 㸽笠਍††晩⠠牁慲⹹獩牁慲⡹⥶ ൻ ††漠瑵瀮獵⡨①死㩽⥠਍†††潦⁲挨湯瑳椠⁴景瘠 ൻ †††氠瑥瘠污㴠匠牴湩⡧瑩ഩ †††椠⁦渨敥獤畑瑯⡥慶⥬ 慶⁬‽∧‧‫慶⹬敲汰捡⡥∯术‬尧≜⤧⬠✠✢਍††††畯⹴異桳怨†‭笤慶絬⥠਍†††ൽ †素攠獬⁥晩⠠祴数景瘠㴠㴽✠潢汯慥❮ ൻ ††漠瑵瀮獵⡨①死㩽␠登㼠✠牴敵‧›昧污敳紧⥠਍††⁽汥敳椠⁦瘨㴠㴽渠汵⁬籼瘠㴠㴽甠摮晥湩摥 ൻ ††漠瑵瀮獵⡨①死㩽⥠਍††⁽汥敳笠਍†††敬⁴慶⁬‽瑓楲杮瘨ഩ ††椠⁦渨敥獤畑瑯⡥慶⥬ 慶⁬‽∧‧‫慶⹬敲汰捡⡥∯术‬尧≜⤧⬠✠✢਍†††畯⹴異桳怨笤絫›笤慶絬⥠਍††ൽ 素਍†潣獮⁴敫獹㴠传橢捥⹴敫獹搨瑡⥡਍†潦⁲挨湯瑳欠漠⁦敫獹 異桳噋欨‬慤慴歛⥝਍†敲畴湲漠瑵樮楯⡮尧❮ഩ紊਍਍畦据楴湯爠扥極摬潄⡣浦‬潢祤 ൻ 挠湯瑳礠㴠眠楲整慙汭昨⥭਍†敲畴湲怠ⴭ尭⑮祻屽⵮ⴭ湜湜笤潢祤恽਍ൽഊ⼊ 䵘ⵌ偒⁃業楮慭⁬湥潣敤⽲敤潣敤൲昊湵瑣潩⁮浸䕬捳灡⡥⥳笠爠瑥牵⁮瑓楲杮猨⸩敲汰捡⡥☯术‬☧浡㭰⤧爮灥慬散⼨⼼Ⱨ✠氦㭴⤧爮灥慬散⼨⼾Ⱨ✠朦㭴⤧爮灥慬散⼨≜术‬☧畱瑯✻⸩敲汰捡⡥✯术‬☧㌣㬹⤧素਍畦据楴湯砠汭湅潣敤慖畬⡥⥶笠਍†晩⠠⁶㴽‽畮汬簠⁼⁶㴽‽湵敤楦敮⥤爠瑥牵⁮㰧楮⽬✾਍†晩⠠牁慲⹹獩牁慲⡹⥶ 敲畴湲✠愼牲祡㰾慤慴✾⬠瘠洮灡砨㴠‾㱠慶畬㹥笤浸䕬据摯噥污敵砨紩⼼慶畬㹥⥠樮楯⡮✧ ‫㰧搯瑡㹡⼼牡慲㹹ധ 椠⁦瘨椠獮慴据潥⁦慄整 敲畴湲怠搼瑡呥浩⹥獩㡯〶㸱笤獩㡯〶⠱⥶㱽搯瑡呥浩⹥獩㡯〶㸱ൠ 挠湯瑳琠㴠琠灹潥⁦൶ 椠⁦琨㴠㴽✠潢汯慥❮ 敲畴湲怠戼潯敬湡␾登㼠ㄠ㨠〠㱽戯潯敬湡怾਍†晩⠠⁴㴽‽渧浵敢❲ 敲畴湲丠浵敢⹲獩湉整敧⡲⥶㼠怠椼瑮␾登㱽椯瑮怾㨠怠搼畯汢㹥笤絶⼼潤扵敬怾਍†晩⠠⁴㴽‽漧橢捥❴ 敲畴湲✠猼牴捵㹴‧‫扏敪瑣攮瑮楲獥瘨⸩慭⡰嬨Ⱬ瘠污⥝㴠‾㱠敭扭牥㰾慮敭␾硻汭獅慣数欨紩⼼慮敭㰾慶畬㹥笤浸䕬据摯噥污敵瘨污紩⼼慶畬㹥⼼敭扭牥怾⸩潪湩✨⤧⬠✠⼼瑳畲瑣✾਍†敲畴湲怠猼牴湩㹧笤浸䕬捳灡⡥瑓楲杮瘨⤩㱽猯牴湩㹧ൠ紊਍畦据楴湯砠汭畂汩䍤污⡬敭桴摯‬慰慲獭 ൻ 爠瑥牵⁮㱠砿汭瘠牥楳湯∽⸱∰㸿洼瑥潨䍤污㹬洼瑥潨乤浡㹥笤浸䕬捳灡⡥敭桴摯紩⼼敭桴摯慎敭㰾慰慲獭怾⬠瀠牡浡⹳慭⡰⁰㸽怠瀼牡浡㰾慶畬㹥笤浸䕬据摯噥污敵瀨紩⼼慶畬㹥⼼慰慲㹭⥠樮楯⡮✧ ‫㱠瀯牡浡㹳⼼敭桴摯慃汬怾਍ൽ昊湵瑣潩⁮浸偬牡敳敒灳湯敳琨硥⥴笠਍†潣獮⁴潤⁣‽敮⁷佄偍牡敳⡲⸩慰獲䙥潲卭牴湩⡧整瑸‬琧硥⽴浸❬ഩ 挠湯瑳映畡瑬㴠搠捯朮瑥汅浥湥獴祂慔乧浡⡥昧畡瑬⤧せ൝ 挠湯瑳瀠牡敳慖⁬‽渨摯⥥㴠‾ൻ †椠⁦ℨ潮敤 敲畴湲渠汵൬ †挠湯瑳渠浡⁥‽潮敤渮摯乥浡൥ †椠⁦渨浡⁥㴽‽瘧污敵⤧笠爠瑥牵⁮潮敤挮楨摬敲⹮敬杮桴㼠瀠牡敳慖⡬潮敤挮楨摬敲孮崰 ›渨摯⹥整瑸潃瑮湥⁴㼿✠⤧素਍††晩⠠❛瑳楲杮Ⱗ椧✴✬湩❴✬潤扵敬Ⱗ戧潯敬湡Ⱗ搧瑡呥浩⹥獩㡯〶✱⹝湩汣摵獥渨浡⥥ ൻ ††挠湯瑳猠㴠⠠潮敤琮硥䍴湯整瑮簠⁼✧⸩牴浩⤨਍†††晩⠠慮敭㴠㴽✠潢汯慥❮ 敲畴湲猠㴠㴽✠✱਍†††晩⠠慮敭㴠㴽✠湩❴簠⁼慮敭㴠㴽✠㑩⤧爠瑥牵⁮慰獲䥥瑮猨‬〱ഩ ††椠⁦渨浡⁥㴽‽搧畯汢❥ 敲畴湲丠浵敢⡲⥳਍†††敲畴湲猠਍††ൽ †椠⁦渨浡⁥㴽‽猧牴捵❴ ൻ ††挠湯瑳漠橢㴠笠ൽ ††挠湯瑳洠浥敢獲㴠渠摯⹥敧䕴敬敭瑮䉳呹条慎敭✨敭扭牥⤧਍†††潦⁲氨瑥椠㴠〠※⁩‼敭扭牥⹳敬杮桴※⭩⤫笠਍††††潣獮⁴⁭‽敭扭牥孳嵩਍††††潣獮⁴敫⁹‽洨朮瑥汅浥湥獴祂慔乧浡⡥渧浡❥嬩崰⸿整瑸潃瑮湥⥴簠⁼✧਍††††潣獮⁴慶⁬‽慰獲噥污洨朮瑥汅浥湥獴祂慔乧浡⡥瘧污敵⤧せ⥝਍††††扯孪敫嵹㴠瘠污਍†††ൽ ††爠瑥牵⁮扯൪ †素਍††晩⠠慮敭㴠㴽✠牡慲❹ ൻ ††挠湯瑳搠瑡䕡⁬‽潮敤朮瑥汅浥湥獴祂慔乧浡⡥搧瑡❡嬩崰਍†††晩⠠搡瑡䕡⥬爠瑥牵⁮嵛਍†††潣獮⁴牡⁲‽嵛਍†††潦⁲氨瑥椠㴠〠※⁩‼慤慴汅挮楨摬敲⹮敬杮桴※⭩⤫笠਍††††晩⠠慤慴汅挮楨摬敲孮嵩渮摯乥浡⁥㴽‽瘧污敵⤧愠牲瀮獵⡨慰獲噥污搨瑡䕡⹬档汩牤湥楛⥝ഩ ††素਍†††敲畴湲愠牲਍††ൽ †爠瑥牵⁮潮敤琮硥䍴湯整瑮㼠‿✧਍†ൽ 椠⁦昨畡瑬 ൻ †挠湯瑳瘠㴠映畡瑬朮瑥汅浥湥獴祂慔乧浡⡥瘧污敵⤧せ൝ †挠湯瑳漠橢㴠瀠牡敳慖⡬⥶਍††潣獮⁴獭⁧‽漨橢☠…漨橢昮畡瑬瑓楲杮簠⁼扯孪昧畡瑬瑓楲杮崧⤩簠⁼堧䱍刭䍐馔꿨➯਍††潣獮⁴潣敤㴠⠠扯⁪☦⠠扯⹪慦汵䍴摯⁥籼漠橢❛慦汵䍴摯❥⥝ 籼ⴠറ †挠湯瑳攠牲㴠渠睥䔠牲牯怨䵘ⵌ偒⁃铩꾯␠捻摯絥›笤獭絧⥠਍††牥⹲潣敤㴠挠摯൥ †琠牨睯攠牲਍†ൽ 挠湯瑳瀠牡浡⁳‽潤⹣敧䕴敬敭瑮䉳呹条慎敭✨慰慲獭⤧せ൝ 椠⁦ℨ慰慲獭 敲畴湲渠汵൬ 挠湯瑳映物瑳㴠瀠牡浡⹳敧䕴敬敭瑮䉳呹条慎敭✨慰慲❭嬩崰਍†晩⠠昡物瑳 敲畴湲渠汵൬ 挠湯瑳瘠污敵㴠映物瑳朮瑥汅浥湥獴祂慔乧浡⡥瘧污敵⤧せ൝ 爠瑥牵⁮慰獲噥污瘨污敵ഩ紊਍਍畦据楴湯戠極摬牐硯敩啤汲攨摮潰湩ⱴ瀠潲祸牕⥬笠਍†晩⠠瀡潲祸牕⥬爠瑥牵⁮湥灤楯瑮਍†牴⁹ൻ †椠⁦瀨潲祸牕⹬湩汣摵獥✨瑻牡敧絴⤧ 敲畴湲瀠潲祸牕⹬敲汰捡⡥笧慴杲瑥❽‬湥潣敤剕䍉浯潰敮瑮攨摮潰湩⥴ഩ †椠⁦瀨潲祸牕⹬湩汣摵獥✨✿⤩爠瑥牵⁮牰硯啹汲⬠✠琦牡敧㵴‧‫湥潣敤剕䍉浯潰敮瑮攨摮潰湩⥴਍††晩⠠牰硯啹汲攮摮坳瑩⡨⼧⤧ 敲畴湲瀠潲祸牕⁬‫湥潣敤剕䍉浯潰敮瑮攨摮潰湩⥴਍††敲畴湲瀠潲祸牕⁬‫㼧慴杲瑥✽⬠攠据摯啥䥒潃灭湯湥⡴湥灤楯瑮ഩ 素挠瑡档笠爠瑥牵⁮湥灤楯瑮素਍ൽഊ愊祳据映湵瑣潩⁮浸剬捰潐瑳挨硴‬湥灤楯瑮‬浸ⱬ瀠潲祸牕⥬笠਍†潣獮⁴牵⁬‽畢汩偤潲楸摥牕⡬湥灤楯瑮‬牰硯啹汲ഩ ⼠ 牐晥牥栠獯⁴瑨灴⠠慴牵⵩瑨灴 潴戠灹獡⁳佃卒※慦汬慢正琠⁯敦捴൨ 琠祲笠਍††晩⠠瑣㽸栮瑴㽰昮瑥档 ൻ ††挠湯瑳爠㴠愠慷瑩挠硴栮瑴⹰敦捴⡨牵ⱬ笠洠瑥潨㩤✠佐呓Ⱗ栠慥敤獲›⁻䌧湯整瑮吭灹❥›琧硥⽴浸❬素‬潢祤›浸⁬⥽਍†††潣獮⁴硴⁴‽睡楡⁴⹲整瑸⤨਍†††晩⠠爡漮⥫琠牨睯渠睥䔠牲牯怨呈偔␠牻献慴畴絳›笤硴⹴汳捩⡥ⰰ㈠〰紩⥠਍†††敲畴湲砠汭慐獲剥獥潰獮⡥硴⥴਍††ൽ 素挠瑡档⠠⥥笠਍††⼯映污瑬牨畯桧琠⁯敦捴൨ 素਍†潣獮⁴敲灳㴠愠慷瑩映瑥档用汲‬⁻敭桴摯›倧协❔‬敨摡牥㩳笠✠潃瑮湥⵴祔数㨧✠整瑸砯汭‧ⱽ戠摯㩹砠汭素ഩ 挠湯瑳琠硥⁴‽睡楡⁴敲灳琮硥⡴ഩ 椠⁦ℨ敲灳漮⥫琠牨睯渠睥䔠牲牯怨呈偔␠牻獥⹰瑳瑡獵㩽␠瑻硥⹴汳捩⡥ⰰ㈠〰紩⥠਍†敲畴湲砠汭慐獲剥獥潰獮⡥整瑸ഩ紊਍਍畦据楴湯瀠牡敳楌瑳湉異⡴⥳笠爠瑥牵⁮猨簠⁼✧⸩灳楬⡴Ⱗ⤧洮灡砨㴠‾⹸牴浩⤨⸩楦瑬牥䈨潯敬湡 ൽഊ⼊ 㴽㴽㴽㴽㴽唠⁉效灬牥⁳㴽㴽㴽㴽㴽਍畦据楴湯攠獮牵卥祴敬⤨笠਍†晩⠠潤畣敭瑮朮瑥汅浥湥䉴䥹⡤琧⵰汦⵹瑳汹❥⤩爠瑥牵൮ 挠湯瑳挠獳㴠怠਍†琮⵰汦⵹癯牥慬筹潰楳楴湯昺硩摥椻獮瑥〺戻捡杫潲湵㩤杲慢〨〬〬⸬㔳㬩楤灳慬㩹汦硥愻楬湧椭整獭挺湥整㭲番瑳晩⵹潣瑮湥㩴散瑮牥稻椭摮硥㤺〰〰ൽ ⸠灴昭祬栭摩敤筮楤灳慬㩹潮敮ൽ ⸠灴昭祬搭慩潬筧楷瑤㩨㘵瀰㭸慭⵸楷瑤㩨慣捬ㄨ〰‥‭〴硰㬩慢正牧畯摮瘺牡⴨戭⥧挻汯牯瘺牡⴨昭⥧戻牯敤㩲瀱⁸潳楬⁤慶⡲ⴭ潢摲牥㬩潢摲牥爭摡畩㩳㈱硰戻硯猭慨潤㩷‰㈱硰㌠瀶⁸杲慢〨〬〬⸬⤲紻਍†琮⵰汦⵹敨摡牥摻獩汰祡昺敬㭸污杩⵮瑩浥㩳散瑮牥樻獵楴祦挭湯整瑮猺慰散戭瑥敷湥瀻摡楤杮ㄺ瀲⁸㘱硰戻牯敤⵲潢瑴浯ㄺ硰猠汯摩瘠牡⴨戭牯敤⥲昻湯⵴敷杩瑨㘺〰昻湯⵴楳敺ㄺ瀴絸਍†琮⵰汦⵹潢祤灻摡楤杮ㄺ瀲⁸㘱硰活硡栭楥桧㩴㔶桶漻敶晲潬㩷畡潴ൽ ⸠灴昭祬札楲筤楤灳慬㩹牧摩朻楲ⵤ整灭慬整挭汯浵獮ㄺ〴硰ㄠ牦朻灡ㄺ瀰㭸污杩⵮瑩浥㩳散瑮牥ൽ ⸠灴昭祬札楲⁤慬敢筬潣潬㩲慶⡲ⴭ畭整⥤昻湯⵴楳敺ㄺ瀲絸਍†琮⵰汦⵹牧摩椠灮瑵瑛灹㵥琢硥≴ⱝ琮⵰汦⵹牧摩椠灮瑵瑛灹㵥瀢獡睳牯≤ⱝ琮⵰汦⵹牧摩椠灮瑵瑛灹㵥產汲崢⸬灴昭祬札楲⁤湩異孴祴数∽慤整楴敭氭捯污崢睻摩桴ㄺ〰㬥慰摤湩㩧瀸⁸〱硰戻牯敤㩲瀱⁸潳楬⁤慶⡲ⴭ潢摲牥㬩慢正牧畯摮瘺牡⴨戭⥧挻汯牯瘺牡⴨昭⥧戻牯敤⵲慲楤獵㠺硰漻瑵楬敮渺湯㭥潦瑮猭穩㩥㌱硰活湩眭摩桴〺戻硯猭穩湩㩧潢摲牥戭硯ൽ ⸠灴昭祬愭瑣潩獮摻獩汰祡昺敬㭸番瑳晩⵹潣瑮湥㩴汦硥攭摮朻灡ㄺ瀰㭸慭杲湩琭灯ㄺ瀲絸਍†琮⵰汦⵹瑢筮畣獲牯瀺楯瑮牥戻牯敤㩲瀱⁸潳楬⁤慶⡲ⴭ潢摲牥㬩慢正牧畯摮爺执⡡㈱ⰷ㈱ⰷ㈱ⰷ〮⤸挻汯牯瘺牡⴨昭⥧戻牯敤⵲慲楤獵㠺硰瀻摡楤杮㘺硰ㄠ瀲㭸潦瑮猭穩㩥㌱硰ൽ ⸠灴昭祬戭湴瀮楲慭祲扻牯敤⵲潣潬㩲㈣㘵攳㭢慢正牧畯摮⌺㔲㌶扥挻汯牯⌺晦給਍†琮⵰汦⵹潲晷汵筬牧摩挭汯浵㩮⼱ㄭ挻汯牯瘺牡⴨洭瑵摥㬩潦瑮猭穩㩥㈱硰ൽ 怠਍†潣獮⁴瑳汹⁥‽潤畣敭瑮挮敲瑡䕥敬敭瑮✨瑳汹❥ഩ 猠祴敬椮⁤‽琧⵰汦⵹瑳汹❥਍†瑳汹⹥整瑸潃瑮湥⁴‽獣൳ 搠捯浵湥⹴敨摡愮灰湥䍤楨摬猨祴敬ഩ紊਍਍畦据楴湯漠数佮敶汲祡琨瑩敬‬潣瑮湥䉴極摬牥 ൻ 攠獮牵卥祴敬⤨਍†潣獮⁴癯牥慬⁹‽潤畣敭瑮挮敲瑡䕥敬敭瑮✨楤❶ഩ 漠敶汲祡挮慬獳慎敭㴠✠灴昭祬漭敶汲祡ധ 挠湯瑳搠慩潬⁧‽潤畣敭瑮挮敲瑡䕥敬敭瑮✨楤❶ഩ 搠慩潬⹧汣獡乳浡⁥‽琧⵰汦⵹楤污杯ധ 搠慩潬⹧湩敮䡲䵔⁌‽㱠楤⁶汣獡㵳琢⵰汦⵹敨摡牥㸢搼癩␾瑻瑩敬㱽搯癩㰾畢瑴湯挠慬獳∽灴昭祬戭湴•摩∽灴挭潬敳㸢韃⼼畢瑴湯㰾搯癩㰾楤⁶汣獡㵳琢⵰汦⵹潢祤㸢⼼楤㹶ൠ 搠捯浵湥⹴潢祤愮灰湥䍤楨摬漨敶汲祡ഩ 漠敶汲祡愮灰湥䍤楨摬搨慩潬⥧਍†潣獮⁴潢祤㴠搠慩潬⹧畱牥卹汥捥潴⡲⸧灴昭祬戭摯❹ഩ 挠湯瑳挠潬敳㴠⠠ 㸽笠琠祲笠漠敶汲祡爮浥癯⡥ ⁽慣捴⁨絻素਍†楤污杯焮敵祲敓敬瑣牯✨琣⵰汣獯❥⸩摡䕤敶瑮楌瑳湥牥✨汣捩❫‬汣獯⥥਍†癯牥慬⹹摡䕤敶瑮楌瑳湥牥✨汣捩❫‬攨 㸽笠椠⁦攨琮牡敧⁴㴽‽癯牥慬⥹挠潬敳⤨素ഩ 挠湯整瑮畂汩敤⡲潢祤‬汣獯⥥਍†敲畴湲笠漠敶汲祡‬楤污杯‬潢祤‬汣獯⁥ൽ紊਍਍⼯㴠㴽㴽㴽㴽‽敓瑴湩獧唠⁉㴽㴽㴽㴽㴽਍硥潰瑲愠祳据映湵瑣潩⁮灯湥敓瑴湩獧挨硴 ൻ 挠湯瑳猠㴠传橢捥⹴獡楳湧笨攠摮潰湩㩴✧‬牰硯啹汲✺Ⱗ甠敳湲浡㩥✧‬慰獳潷摲✺Ⱗ戠潬䥧㩤〧Ⱗ甠敳畃牲湥呴浩㩥牴敵‬異汢獩周浩佥晦敳㩴‰ⱽ愠慷瑩氠慯卤瑥楴杮⡳瑣⥸簠⁼絻ഩ 漠数佮敶汲祡✨祔数档⁯迥莸駥뺮뷧ⰿ⠠潢祤‬汣獯⥥㴠‾ൻ †挠湯瑳眠慲⁰‽潤畣敭瑮挮敲瑡䕥敬敭瑮✨楤❶ഩ †眠慲⹰汣獡乳浡⁥‽琧⵰汦⵹牧摩ധ †眠慲⹰湩敮䡲䵔⁌‽ൠ ††㰠慬敢㹬軦ꎏ唠䱒⼼慬敢㹬椼灮瑵椠㵤琢⵰湥灤楯瑮•祴数∽牵≬瀠慬散潨摬牥∽瑨灴㩳⼯潹牵猭瑩⹥潣⽭浸牬捰瀮灨•慶畬㵥␢獻攮摮潰湩⁴籼✠紧㸢਍†††氼扡汥ꢔ裦㾐氯扡汥㰾湩異⁴摩∽灴甭敳湲浡≥琠灹㵥琢硥≴瘠污敵∽笤⹳獵牥慮敭簠⁼✧≽ാ ††㰠慬敢㹬꿥膠⼼慬敢㹬椼灮瑵椠㵤琢⵰慰獳潷摲•祴数∽慰獳潷摲•慶畬㵥␢獻瀮獡睳牯⁤籼✠紧㸢਍†††氼扡汥颻껨骍껥䦢㱄氯扡汥㰾湩異⁴摩∽灴戭潬楧≤琠灹㵥琢硥≴瘠污敵∽笤⹳汢杯摉簠⁼〧紧㸢਍†††氼扡汥䌾剏⁓믤蚐⼼慬敢㹬椼灮瑵椠㵤琢⵰牰硯≹琠灹㵥產汲•汰捡桥汯敤㵲꾏郥₫瑻牡敧絴•慶畬㵥␢獻瀮潲祸牕⁬籼✠紧㸢਍†††搼癩挠慬獳∽灴昭祬爭睯畦汬㸢믥꺮볤袅뷤ꢔꇦꊝ軧莢볯薆뷧龎铧醽믧花볯뾁藥䌿剏鮼ꛥ肜뗦袧駥薆뷤ꢔ볯랯藩꺽蟨못믤蚐胣⼿楤㹶਍†††氼扡汥뾽铧鎽觥뚗韩㲴氯扡汥㰾湩異⁴摩∽灴甭敳畣≲琠灹㵥挢敨正潢≸␠獻甮敳畃牲湥呴浩⁥‿挧敨正摥‧›✧㹽਍†††氼扡汥醏룥뚗韩辁꟧⢻냥뚗㰩氯扡汥㰾湩異⁴摩∽灴漭晦敳≴琠灹㵥琢硥≴瘠污敵∽笤⹳異汢獩周浩佥晦敳⁴籼〠≽ാ †怠਍††潢祤愮灰湥䍤楨摬眨慲⥰਍††潣獮⁴捡楴湯⁳‽潤畣敭瑮挮敲瑡䕥敬敭瑮✨楤❶ഩ †愠瑣潩獮挮慬獳慎敭㴠✠灴昭祬愭瑣潩獮ധ †挠湯瑳戠湴敔瑳㴠搠捯浵湥⹴牣慥整汅浥湥⡴戧瑵潴❮ഩ †戠湴敔瑳挮慬獳慎敭㴠✠灴昭祬戭湴ധ †戠湴敔瑳琮硥䍴湯整瑮㴠✠뗦閯뿨ꖎധ †挠湯瑳戠湴慓敶㴠搠捯浵湥⹴牣慥整汅浥湥⡴戧瑵潴❮ഩ †戠湴慓敶挮慬獳慎敭㴠✠灴昭祬戭湴瀠楲慭祲ധ †戠湴慓敶琮硥䍴湯整瑮㴠✠뿤颭ധ †挠湯瑳戠湴慃据汥㴠搠捯浵湥⹴牣慥整汅浥湥⡴戧瑵潴❮ഩ †戠湴慃据汥挮慬獳慎敭㴠✠灴昭祬戭湴ധ †戠湴慃据汥琮硥䍴湯整瑮㴠✠迥袶ധ †愠瑣潩獮愮灰湥䍤楨摬戨湴敔瑳㬩愠瑣潩獮愮灰湥䍤楨摬戨湴慓敶㬩愠瑣潩獮愮灰湥䍤楨摬戨湴慃据汥ഩ †戠摯⹹灡数摮桃汩⡤捡楴湯⥳਍਍††瑢䍮湡散⹬摡䕤敶瑮楌瑳湥牥✨汣捩❫‬⤨㴠‾汣獯⡥⤩਍††瑢卮癡⹥摡䕤敶瑮楌瑳湥牥✨汣捩❫‬獡湹⁣⤨㴠‾ൻ ††挠湯瑳渠⁳‽ൻ †††攠摮潰湩㩴戠摯⹹畱牥卹汥捥潴⡲⌧灴攭摮潰湩❴⸩慶畬⹥牴浩⤨ബ †††甠敳湲浡㩥戠摯⹹畱牥卹汥捥潴⡲⌧灴甭敳湲浡❥⸩慶畬⹥牴浩⤨ബ †††瀠獡睳牯㩤戠摯⹹畱牥卹汥捥潴⡲⌧灴瀭獡睳牯❤⸩慶畬ⱥ਍††††汢杯摉›潢祤焮敵祲敓敬瑣牯✨琣⵰汢杯摩⤧瘮污敵琮楲⡭ 籼✠✰ബ †††瀠潲祸牕㩬戠摯⹹畱牥卹汥捥潴⡲⌧灴瀭潲祸⤧瘮污敵琮楲⡭Ⱙ਍††††獵䍥牵敲瑮楔敭›℡潢祤焮敵祲敓敬瑣牯✨琣⵰獵捥牵⤧挮敨正摥ബ †††瀠扵楬桳楔敭晏獦瑥›慰獲䙥潬瑡戨摯⹹畱牥卹汥捥潴⡲⌧灴漭晦敳❴⸩慶畬⥥簠⁼ⰰ਍†††ൽ ††愠慷瑩猠癡卥瑥楴杮⡳瑣ⱸ渠⥳਍†††牴⁹⁻瑣⹸極⸿潮楴散⸿✨껨꺽럥鶿귥ⰿ✠歯Ⱗㄠ〵⤰素挠瑡档笠ൽ ††挠潬敳⤨਍††⥽਍††瑢呮獥⹴摡䕤敶瑮楌瑳湥牥✨汣捩❫‬獡湹⁣⤨㴠‾ൻ ††琠祲笠਍††††潣獮⁴灥㴠戠摯⹹畱牥卹汥捥潴⡲⌧灴攭摮潰湩❴⸩慶畬⹥牴浩⤨਍††††潣獮⁴牰硯⁹‽潢祤焮敵祲敓敬瑣牯✨琣⵰牰硯❹⸩慶畬⹥牴浩⤨਍††††晩⠠攡⥰笠愠敬瑲✨꿨ꮡ蛥ꖎ迥唿䱒⤧※敲畴湲素਍††††潣獮⁴浸⁬‽浸䉬極摬慃汬✨祳瑳浥氮獩䵴瑥潨獤Ⱗ嬠⥝਍††††睡楡⁴浸剬捰潐瑳挨硴‬灥‬浸ⱬ瀠潲祸ഩ †††愠敬瑲✨뿨ꖎ귦뢸⤧਍†††⁽慣捴⁨攨 ⁻污牥⡴麿軦놤듨㪥✠⬠⠠㽥洮獥慳敧簠⁼⥥ ൽ †素ഩ 素ഩ紊਍਍⼯㴠㴽㴽㴽㴽‽畐汢獩⁨楄污杯㴠㴽㴽㴽㴽ഽ昊湵瑣潩⁮潴潌慣䑬協牴搨 ⁻潣獮⁴⁰‽渨㴩匾牴湩⡧⥮瀮摡瑓牡⡴ⰲ〧⤧※敲畴湲怠笤⹤敧䙴汵奬慥⡲紩␭灻搨朮瑥潍瑮⡨⬩⤱⵽笤⡰⹤敧䑴瑡⡥⤩命笤⡰⹤敧䡴畯獲⤨紩␺灻搨朮瑥楍畮整⡳⤩恽素਍਍獡湹⁣畦据楴湯漠数偮扵楬桳楄污杯挨硴 ൻ 挠湯瑳猠瑥楴杮⁳‽扏敪瑣愮獳杩⡮⁻湥灤楯瑮✺Ⱗ瀠潲祸牕㩬✧‬獵牥慮敭✺Ⱗ瀠獡睳牯㩤✧‬汢杯摉✺✰‬獵䍥牵敲瑮楔敭琺畲ⱥ瀠扵楬桳楔敭晏獦瑥〺素‬睡楡⁴潬摡敓瑴湩獧挨硴 籼笠⥽਍†晩⠠猡瑥楴杮⹳湥灤楯瑮簠⁼猡瑥楴杮⹳獵牥慮敭簠⁼猡瑥楴杮⹳慰獳潷摲 ൻ †挠湯瑳朠⁯‽睡楡⁴瑣⹸極⸿潣普物㽭⠮骰鳦超뷧₮祔数档⁯迥낕볯꾘郥낎鳥뺮뷧龼⤧਍††晩⠠潧 敲畴湲漠数卮瑥楴杮⡳瑣⥸਍††敲畴湲਍†ൽ 挠湯瑳爠睡㴠挠硴朮瑥摅瑩牯慖畬⡥ഩ 挠湯瑳笠搠瑡㩡映Ɑ戠摯⁹⁽‽慰獲䙥潲瑮慭瑴牥爨睡ഩ 挠湯瑳䬠㴠笠琠瑩敬✺楴汴❥‬汳杵✺汳杵Ⱗ琠条㩳琧条❳‬慣整潧楲獥✺慣整潧楲獥Ⱗ搠慲瑦✺牤晡❴‬楣㩤挧摩Ⱗ搠瑡䍥敲瑡摥✺慤整牃慥整❤素਍†潣獮⁴牰獥瑥㴠笠਍††楴汴㩥⠠浦䭛琮瑩敬⁝籼✠⤧琮卯牴湩⡧ 籼✠鳦붑郥螖ꇦⰿ਍††汳杵›昨孭⹋汳杵⁝籼✠⤧琮卯牴湩⡧Ⱙ਍††慴獧›牁慲⹹獩牁慲⡹浦䭛琮条嵳 ‿浦䭛琮条嵳㨠瀠牡敳楌瑳湉異⡴浦䭛琮条嵳簠⁼✧Ⱙ਍††慣整潧楲獥›牁慲⹹獩牁慲⡹浦䭛挮瑡来牯敩嵳 ‿浦䭛挮瑡来牯敩嵳㨠瀠牡敳楌瑳湉異⡴浦䭛挮瑡来牯敩嵳簠⁼✧Ⱙ਍††牤晡㩴℠昡孭⹋牤晡嵴ബ †搠瑡䍥敲瑡摥›浦䭛搮瑡䍥敲瑡摥⁝‿敮⁷慄整匨牴湩⡧浦䭛搮瑡䍥敲瑡摥⥝ ›敮⁷慄整⤨ബ †挠摩›浦䭛挮摩⁝‿瑓楲杮昨孭⹋楣嵤 ›✧਍†ൽ 挠湯瑳椠楮䑴瑡⁥‽敳瑴湩獧甮敳畃牲湥呴浩⁥‿敮⁷慄整⤨㨠⠠牰獥瑥搮瑡䍥敲瑡摥簠⁼敮⁷慄整⤨ഩഊ 漠数佮敶汲祡✨迥莸裥吿灹捥潨Ⱗ⠠潢祤汅‬汣獯⥥㴠‾ൻ †挠湯瑳眠慲⁰‽潤畣敭瑮挮敲瑡䕥敬敭瑮✨楤❶ഩ †眠慲⹰汣獡乳浡⁥‽琧⵰汦⵹牧摩ധ †眠慲⹰湩敮䡲䵔⁌‽ൠ ††㰠慬敢㹬ꃦ颢⼼慬敢㹬椼灮瑵椠㵤琢⵰楴汴≥琠灹㵥琢硥≴瘠污敵∽笤牰獥瑥琮瑩敬≽ാ ††㰠慬敢㹬汓杵⼼慬敢㹬椼灮瑵椠㵤琢⵰汳杵•祴数∽整瑸•汰捡桥汯敤㵲꾏闧㾩瘠污敵∽笤牰獥瑥献畬⁧籼✠紧㸢਍†††氼扡汥螠귧㲾氯扡汥㰾湩異⁴摩∽灴琭条≳琠灹㵥琢硥≴瀠慬散潨摬牥∽胩랏裥钚•慶畬㵥␢灻敲敳⹴慴獧樮楯⡮Ⱗ✠紩㸢਍†††氼扡汥蚈뇧㲻氯扡汥㰾湩異⁴摩∽灴挭瑡≳琠灹㵥琢硥≴瀠慬散潨摬牥∽胩랏裥钚볯뎇냥ㄿ㾸瘠污敵∽笤牰獥瑥挮瑡来牯敩⹳潪湩✨‬⤧≽ാ ††㰠慬敢㹬跨뾨⼼慬敢㹬椼灮瑵椠㵤琢⵰牤晡≴琠灹㵥挢敨正潢≸␠灻敲敳⹴牤晡⁴‿挧敨正摥‧›✧㹽਍†††氼扡汥醏룥뚗韩㲴氯扡汥㰾湩異⁴摩∽灴搭瑡≥琠灹㵥搢瑡瑥浩ⵥ潬慣≬瘠污敵∽笤潴潌慣䑬協牴椨楮䑴瑡⥥≽ാ ††㰠楤⁶汣獡㵳琢⵰汦⵹潲晷汵≬蚰뷤ꢔ껨꺽룤蒚韦뒗臥㾧␠獻瑥楴杮⹳異汢獩周浩佥晦敳⁴籼〠⁽냥뚗⼼楤㹶਍††ൠ †戠摯䕹⹬灡数摮桃汩⡤牷灡ഩ †挠湯瑳愠瑣潩獮㴠搠捯浵湥⹴牣慥整汅浥湥⡴搧癩⤧਍††捡楴湯⹳汣獡乳浡⁥‽琧⵰汦⵹捡楴湯❳਍††潣獮⁴瑢䍮湡散⁬‽潤畣敭瑮挮敲瑡䕥敬敭瑮✨畢瑴湯⤧਍††瑢䍮湡散⹬汣獡乳浡⁥‽琧⵰汦⵹瑢❮਍††瑢䍮湡散⹬整瑸潃瑮湥⁴‽随뛦➈਍††潣獮⁴瑢佮⁫‽潤畣敭瑮挮敲瑡䕥敬敭瑮✨畢瑴湯⤧਍††瑢佮⹫汣獡乳浡⁥‽琧⵰汦⵹瑢⁮牰浩牡❹਍††瑢佮⹫整瑸潃瑮湥⁴‽醏룥➃਍††捡楴湯⹳灡数摮桃汩⡤瑢䍮湡散⥬※捡楴湯⹳灡数摮桃汩⡤瑢佮⥫਍††潢祤汅愮灰湥䍤楨摬愨瑣潩獮ഩ †戠湴慃据汥愮摤癅湥䱴獩整敮⡲挧楬正Ⱗ⠠ 㸽挠潬敳⤨ഩ †戠湴歏愮摤癅湥䱴獩整敮⡲挧楬正Ⱗ愠祳据⠠ 㸽笠਍†††潣獮⁴楴汴⁥‽潢祤汅焮敵祲敓敬瑣牯✨琣⵰楴汴❥⸩慶畬⹥牴浩⤨簠⁼ꪜ釥趐雦㾡਍†††敬⁴汳杵㴠戠摯䕹⹬畱牥卹汥捥潴⡲⌧灴猭畬❧⸩慶畬⹥牴浩⤨਍†††潣獮⁴慴獧㴠瀠牡敳楌瑳湉異⡴潢祤汅焮敵祲敓敬瑣牯✨琣⵰慴獧⤧瘮污敵ഩ ††挠湯瑳挠瑡⁳‽慰獲䱥獩䥴灮瑵戨摯䕹⹬畱牥卹汥捥潴⡲⌧灴挭瑡❳⸩慶畬⥥਍†††潣獮⁴牤晡⁴‽℡潢祤汅焮敵祲敓敬瑣牯✨琣⵰牤晡❴⸩档捥敫൤ ††椠⁦挨瑡⹳敬杮桴㴠㴽〠 ⁻污牥⡴蚈뇧趸菨몸ꧧ➺㬩爠瑥牵⁮ൽ ††氠瑥搠⁴‽敮⁷慄整匨牴湩⡧潢祤汅焮敵祲敓敬瑣牯✨琣⵰慤整⤧瘮污敵⤩਍†††晩⠠⠡瑤椠獮慴据潥⁦慄整 籼椠乳乡搨⹴敧呴浩⡥⤩ 瑤㴠渠睥䐠瑡⡥ഩ ††椠⁦猨瑥楴杮⹳異汢獩周浩佥晦敳⥴搠⁴‽敮⁷慄整搨⹴敧呴浩⡥ ‫敳瑴湩獧瀮扵楬桳楔敭晏獦瑥⨠㌠〶‰‪〱〰ഩഊ ††琠祲笠਍††††潣獮⁴潰瑳瑓畲瑣㴠笠琠瑩敬‬敤捳楲瑰潩㩮戠摯ⱹ洠彴敫睹牯獤›慴獧樮楯⡮Ⱗ⤧‬慣整潧楲獥›慣獴‬潰瑳瑟灹㩥✠潰瑳Ⱗ眠彰汳杵›汳杵簠⁼✧‬瑭慟汬睯损浯敭瑮㩳ㄠ‬慤整牃慥整㩤搠⁴ൽ †††挠湯瑳栠獡楃⁤‽℡牰獥瑥挮摩਍††††潣獮⁴敭桴摯㴠栠獡楃⁤‿洧瑥坡扥潬⹧摥瑩潐瑳‧›洧瑥坡扥潬⹧敮偷獯❴਍††††潣獮⁴慰慲獭㴠栠獡楃൤ ††††㼠嬠匠牴湩⡧牰獥瑥挮摩Ⱙ猠瑥楴杮⹳獵牥慮敭‬敳瑴湩獧瀮獡睳牯Ɽ瀠獯却牴捵ⱴ℠牤晡⁴൝ ††††㨠嬠匠牴湩⡧敳瑴湩獧戮潬䥧⁤籼✠✰Ⱙ猠瑥楴杮⹳獵牥慮敭‬敳瑴湩獧瀮獡睳牯Ɽ瀠獯却牴捵ⱴ℠牤晡⁴൝ †††挠湯瑳砠汭㴠砠汭畂汩䍤污⡬敭桴摯‬慰慲獭ഩ †††挠湯瑳爠獥汵⁴‽睡楡⁴浸剬捰潐瑳挨硴‬敳瑴湩獧攮摮潰湩ⱴ砠汭‬敳瑴湩獧瀮潲祸牕⥬਍਍††††潣獮⁴灵慤整⁤‽扏敪瑣愮獳杩⡮絻‬浦ഩ †††甠摰瑡摥❛楴汴❥⁝‽楴汴൥ †††甠摰瑡摥❛慴獧崧㴠琠条൳ †††甠摰瑡摥❛慣整潧楲獥崧㴠挠瑡൳ †††甠摰瑡摥❛牤晡❴⁝‽牤晡൴ †††甠摰瑡摥❛慤整牃慥整❤⁝‽獩㡯〶⠱瑤ഩ †††椠⁦ℨ慨䍳摩 ൻ ††††挠湯瑳渠睥楃⁤‽瑓楲杮爨獥汵⥴਍†††††灵慤整孤挧摩崧㴠渠睥楃൤ ††††椠⁦ℨ汳杵 汳杵㴠渠睥楃൤ †††素਍††††灵慤整孤猧畬❧⁝‽汳杵਍††††潣獮⁴敮䑷捯㴠爠扥極摬潄⡣灵慤整Ɽ戠摯⥹਍††††瑣⹸敳䕴楤潴噲污敵渨睥潄⥣਍††††牴⁹⁻瑣⹸極⸿潮楴散⸿栨獡楃⁤‿뒛雦邈諥➟㨠✠迥莸裦龊Ⱗ✠歯Ⱗㄠ〸⤰素挠瑡档笠ൽ †††挠潬敳⤨਍†††⁽慣捴⁨攨 ൻ †††挠湯潳敬攮牲牯攨ഩ †††愠敬瑲✨迥莸ꓥꖴ›‧‫攨⸿敭獳条⁥籼攠⤩਍†††ൽ †素ഩ 素ഩ紊਍਍硥潰瑲愠祳据映湵瑣潩⁮捡楴慶整挨硴 ൻ ⼠ 摁⁤敭畮攠瑮祲琠⁯灯湥琠敨瀠扵楬桳搠慩潬൧ 挠硴愮摤敍畮瑉浥笨氠扡汥›醏룥㾈祔数档❯‬楴汴㩥✠냥鎽觥螖ꇦ醏룥낈吠灹捥潨⠠䵘ⵌ偒⥃Ⱗ漠䍮楬正›獡湹⁣⤨㴠‾⁻睡楡⁴灯湥畐汢獩䑨慩潬⡧瑣⥸素素ഩ紊਍਍硥潰瑲映湵瑣潩⁮敤捡楴慶整⤨笠ൽ
