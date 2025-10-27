@@ -1,13 +1,13 @@
 // Typecho Publisher for flymd (ESM)
-// Minimal plugin: publish current document to Typecho via XML-RPC.
-// Settings are stored in localStorage; network uses fetch and supports a user-provided CORS proxy.
+// Adds settings UI and a publish dialog; prefers host http API to avoid CORS.
 
 const LS_KEY = 'flymd:typecho-publisher:settings'
-
-function getSettings() {
+async function loadSettings(ctx) {
+  try { if (ctx?.storage?.get) { const v = await ctx.storage.get('settings'); if (v && typeof v === 'object') return v } } catch {}
   try { return JSON.parse(localStorage.getItem(LS_KEY) || '{}') || {} } catch { return {} }
 }
-function saveSettings(s) {
+async function saveSettings(ctx, s) {
+  try { if (ctx?.storage?.set) { await ctx.storage.set('settings', s); return } } catch {}
   try { localStorage.setItem(LS_KEY, JSON.stringify(s)) } catch {}
 }
 
@@ -172,8 +172,19 @@ function buildProxiedUrl(endpoint, proxyUrl) {
   } catch { return endpoint }
 }
 
-async function xmlRpcPost(endpoint, xml, proxyUrl) {
+async function xmlRpcPost(ctx, endpoint, xml, proxyUrl) {
   const url = buildProxiedUrl(endpoint, proxyUrl)
+  // Prefer host http (tauri-http) to bypass CORS; fallback to fetch
+  try {
+    if (ctx?.http?.fetch) {
+      const r = await ctx.http.fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/xml' }, body: xml })
+      const txt = await r.text()
+      if (!r.ok) throw new Error(`HTTP ${r.status}: ${txt.slice(0, 200)}`)
+      return xmlParseResponse(txt)
+    }
+  } catch (e) {
+    // fallthrough to fetch
+  }
   const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/xml' }, body: xml })
   const text = await resp.text()
   if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${text.slice(0, 200)}`)
@@ -182,106 +193,201 @@ async function xmlRpcPost(endpoint, xml, proxyUrl) {
 
 function parseListInput(s) { return (s || '').split(',').map(x => x.trim()).filter(Boolean) }
 
+// ========== UI Helpers ==========
+function ensureStyle() {
+  if (document.getElementById('tp-fly-style')) return
+  const css = `
+  .tp-fly-overlay{position:fixed;inset:0;background:rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;z-index:90000}
+  .tp-fly-hidden{display:none}
+  .tp-fly-dialog{width:560px;max-width:calc(100% - 40px);background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:12px;box-shadow:0 12px 36px rgba(0,0,0,.2);}
+  .tp-fly-header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--border);font-weight:600;font-size:14px}
+  .tp-fly-body{padding:12px 16px;max-height:65vh;overflow:auto}
+  .tp-fly-grid{display:grid;grid-template-columns:140px 1fr;gap:10px;align-items:center}
+  .tp-fly-grid label{color:var(--muted);font-size:12px}
+  .tp-fly-grid input[type="text"],.tp-fly-grid input[type="password"],.tp-fly-grid input[type="url"],.tp-fly-grid input[type="datetime-local"]{width:100%;padding:8px 10px;border:1px solid var(--border);background:var(--bg);color:var(--fg);border-radius:8px;outline:none;font-size:13px;min-width:0;box-sizing:border-box}
+  .tp-fly-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:12px}
+  .tp-fly-btn{cursor:pointer;border:1px solid var(--border);background:rgba(127,127,127,.08);color:var(--fg);border-radius:8px;padding:6px 12px;font-size:13px}
+  .tp-fly-btn.primary{border-color:#2563eb;background:#2563eb;color:#fff}
+  .tp-fly-rowfull{grid-column:1/-1;color:var(--muted);font-size:12px}
+  `
+  const style = document.createElement('style')
+  style.id = 'tp-fly-style'
+  style.textContent = css
+  document.head.appendChild(style)
+}
+
+function openOverlay(title, contentBuilder) {
+  ensureStyle()
+  const overlay = document.createElement('div')
+  overlay.className = 'tp-fly-overlay'
+  const dialog = document.createElement('div')
+  dialog.className = 'tp-fly-dialog'
+  dialog.innerHTML = `<div class="tp-fly-header"><div>${title}</div><button class="tp-fly-btn" id="tp-close">×</button></div><div class="tp-fly-body"></div>`
+  document.body.appendChild(overlay)
+  overlay.appendChild(dialog)
+  const body = dialog.querySelector('.tp-fly-body')
+  const close = () => { try { overlay.remove() } catch {} }
+  dialog.querySelector('#tp-close').addEventListener('click', close)
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close() })
+  contentBuilder(body, close)
+  return { overlay, dialog, body, close }
+}
+
+// ========== Settings UI ==========
+export async function openSettings(ctx) {
+  const s = Object.assign({ endpoint:'', proxyUrl:'', username:'', password:'', blogId:'0', useCurrentTime:true, publishTimeOffset:0 }, await loadSettings(ctx) || {})
+  openOverlay('Typecho 发布器设置', (body, close) => {
+    const wrap = document.createElement('div')
+    wrap.className = 'tp-fly-grid'
+    wrap.innerHTML = `
+      <label>接口 URL</label><input id="tp-endpoint" type="url" placeholder="https://your-site.com/xmlrpc.php" value="${s.endpoint || ''}">
+      <label>用户名</label><input id="tp-username" type="text" value="${s.username || ''}">
+      <label>密码</label><input id="tp-password" type="password" value="${s.password || ''}">
+      <label>默认博客ID</label><input id="tp-blogid" type="text" value="${s.blogId || '0'}">
+      <label>CORS 代理</label><input id="tp-proxy" type="url" placeholder="可含 {target}" value="${s.proxyUrl || ''}">
+      <div class="tp-fly-rowfull">建议优先使用桌面环境（内置原生网络层）避免 CORS；如需浏览器内使用，请配置自建代理。</div>
+      <label>使用当前时间</label><input id="tp-usecur" type="checkbox" ${s.useCurrentTime ? 'checked' : ''}>
+      <label>发布时间偏移(小时)</label><input id="tp-offset" type="text" value="${s.publishTimeOffset || 0}">
+    `
+    body.appendChild(wrap)
+    const actions = document.createElement('div')
+    actions.className = 'tp-fly-actions'
+    const btnTest = document.createElement('button')
+    btnTest.className = 'tp-fly-btn'
+    btnTest.textContent = '测试连接'
+    const btnSave = document.createElement('button')
+    btnSave.className = 'tp-fly-btn primary'
+    btnSave.textContent = '保存'
+    const btnCancel = document.createElement('button')
+    btnCancel.className = 'tp-fly-btn'
+    btnCancel.textContent = '取消'
+    actions.appendChild(btnTest); actions.appendChild(btnSave); actions.appendChild(btnCancel)
+    body.appendChild(actions)
+
+    btnCancel.addEventListener('click', () => close())
+    btnSave.addEventListener('click', async () => {
+      const ns = {
+        endpoint: body.querySelector('#tp-endpoint').value.trim(),
+        username: body.querySelector('#tp-username').value.trim(),
+        password: body.querySelector('#tp-password').value,
+        blogId: body.querySelector('#tp-blogid').value.trim() || '0',
+        proxyUrl: body.querySelector('#tp-proxy').value.trim(),
+        useCurrentTime: !!body.querySelector('#tp-usecur').checked,
+        publishTimeOffset: parseFloat(body.querySelector('#tp-offset').value) || 0,
+      }
+      await saveSettings(ctx, ns)
+      try { ctx.ui?.notice?.('设置已保存', 'ok', 1500) } catch {}
+      close()
+    })
+    btnTest.addEventListener('click', async () => {
+      try {
+        const ep = body.querySelector('#tp-endpoint').value.trim()
+        const proxy = body.querySelector('#tp-proxy').value.trim()
+        if (!ep) { alert('请填写接口 URL'); return }
+        const xml = xmlBuildCall('system.listMethods', [])
+        await xmlRpcPost(ctx, ep, xml, proxy)
+        alert('连接正常')
+      } catch (e) { alert('连接失败: ' + (e?.message || e)) }
+    })
+  })
+}
+
+// ========== Publish Dialog ==========
+function toLocalDTStr(d) { const p = (n)=>String(n).padStart(2,'0'); return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}` }
+
+async function openPublishDialog(ctx) {
+  const settings = Object.assign({ endpoint:'', proxyUrl:'', username:'', password:'', blogId:'0', useCurrentTime:true, publishTimeOffset:0 }, await loadSettings(ctx) || {})
+  if (!settings.endpoint || !settings.username || !settings.password) {
+    const go = await ctx.ui?.confirm?.('尚未配置 Typecho 参数，是否现在设置？')
+    if (go) return openSettings(ctx)
+    return
+  }
+  const raw = ctx.getEditorValue()
+  const { data: fm, body } = parseFrontmatter(raw)
+  const K = { title:'title', slug:'slug', tags:'tags', categories:'categories', draft:'draft', cid:'cid', dateCreated:'dateCreated' }
+  const preset = {
+    title: (fm[K.title] || '').toString() || '未命名文档',
+    slug: (fm[K.slug] || '').toString(),
+    tags: Array.isArray(fm[K.tags]) ? fm[K.tags] : parseListInput(fm[K.tags] || ''),
+    categories: Array.isArray(fm[K.categories]) ? fm[K.categories] : parseListInput(fm[K.categories] || ''),
+    draft: !!fm[K.draft],
+    dateCreated: fm[K.dateCreated] ? new Date(String(fm[K.dateCreated])) : new Date(),
+    cid: fm[K.cid] ? String(fm[K.cid]) : ''
+  }
+  const initDate = settings.useCurrentTime ? new Date() : (preset.dateCreated || new Date())
+
+  openOverlay('发布到 Typecho', (bodyEl, close) => {
+    const wrap = document.createElement('div')
+    wrap.className = 'tp-fly-grid'
+    wrap.innerHTML = `
+      <label>标题</label><input id="tp-title" type="text" value="${preset.title}">
+      <label>Slug</label><input id="tp-slug" type="text" placeholder="可留空" value="${preset.slug || ''}">
+      <label>标签</label><input id="tp-tags" type="text" placeholder="逗号分隔" value="${preset.tags.join(', ')}">
+      <label>分类</label><input id="tp-cats" type="text" placeholder="逗号分隔，至少 1 个" value="${preset.categories.join(', ')}">
+      <label>草稿</label><input id="tp-draft" type="checkbox" ${preset.draft ? 'checked' : ''}>
+      <label>发布时间</label><input id="tp-date" type="datetime-local" value="${toLocalDTStr(initDate)}">
+      <div class="tp-fly-rowfull">将使用设置中的时间偏移: ${settings.publishTimeOffset || 0} 小时</div>
+    `
+    bodyEl.appendChild(wrap)
+    const actions = document.createElement('div')
+    actions.className = 'tp-fly-actions'
+    const btnCancel = document.createElement('button')
+    btnCancel.className = 'tp-fly-btn'
+    btnCancel.textContent = '取消'
+    const btnOk = document.createElement('button')
+    btnOk.className = 'tp-fly-btn primary'
+    btnOk.textContent = '发布'
+    actions.appendChild(btnCancel); actions.appendChild(btnOk)
+    bodyEl.appendChild(actions)
+    btnCancel.addEventListener('click', () => close())
+    btnOk.addEventListener('click', async () => {
+      const title = bodyEl.querySelector('#tp-title').value.trim() || '未命名文档'
+      let slug = bodyEl.querySelector('#tp-slug').value.trim()
+      const tags = parseListInput(bodyEl.querySelector('#tp-tags').value)
+      const cats = parseListInput(bodyEl.querySelector('#tp-cats').value)
+      const draft = !!bodyEl.querySelector('#tp-draft').checked
+      if (cats.length === 0) { alert('分类不能为空'); return }
+      let dt = new Date(String(bodyEl.querySelector('#tp-date').value))
+      if (!(dt instanceof Date) || isNaN(dt.getTime())) dt = new Date()
+      if (settings.publishTimeOffset) dt = new Date(dt.getTime() + settings.publishTimeOffset * 3600 * 1000)
+
+      try {
+        const postStruct = { title, description: body, mt_keywords: tags.join(','), categories: cats, post_type: 'post', wp_slug: slug || '', mt_allow_comments: 1, dateCreated: dt }
+        const hasCid = !!preset.cid
+        const method = hasCid ? 'metaWeblog.editPost' : 'metaWeblog.newPost'
+        const params = hasCid
+          ? [ String(preset.cid), settings.username, settings.password, postStruct, !draft ]
+          : [ String(settings.blogId || '0'), settings.username, settings.password, postStruct, !draft ]
+        const xml = xmlBuildCall(method, params)
+        const result = await xmlRpcPost(ctx, settings.endpoint, xml, settings.proxyUrl)
+
+        const updated = Object.assign({}, fm)
+        updated['title'] = title
+        updated['tags'] = tags
+        updated['categories'] = cats
+        updated['draft'] = draft
+        updated['dateCreated'] = iso8601(dt)
+        if (!hasCid) {
+          const newCid = String(result)
+          updated['cid'] = newCid
+          if (!slug) slug = newCid
+        }
+        updated['slug'] = slug
+        const newDoc = rebuildDoc(updated, body)
+        ctx.setEditorValue(newDoc)
+        try { ctx.ui?.notice?.(hasCid ? '更新成功' : '发布成功', 'ok', 1800) } catch {}
+        close()
+      } catch (e) {
+        console.error(e)
+        alert('发布失败: ' + (e?.message || e))
+      }
+    })
+  })
+}
+
 export async function activate(ctx) {
-  // Add a simple menu entry: Publish to Typecho
-  ctx.addMenuItem({ label: '发布到 Typecho', title: '将当前文档发布到 Typecho (XML-RPC)', onClick: async () => {
-    try {
-      const settings = Object.assign({ endpoint: '', proxyUrl: '', username: '', password: '', blogId: '0', useCurrentTime: true, publishTimeOffset: 0 }, getSettings() || {})
-
-      // Ensure essential settings exist
-      if (!settings.endpoint) settings.endpoint = prompt('Typecho XML-RPC 接口地址 (例: https://site/xmlrpc.php):', settings.endpoint || '') || ''
-      if (!settings.username) settings.username = prompt('Typecho 用户名:', settings.username || '') || ''
-      if (!settings.password) settings.password = prompt('Typecho 密码:', settings.password || '') || ''
-      if (!settings.blogId) settings.blogId = prompt('默认博客ID:', settings.blogId || '0') || '0'
-      // Proxy (optional, used to bypass CORS)
-      settings.proxyUrl = prompt('可选：CORS 代理地址 (可含 {target} 占位):', settings.proxyUrl || '') || ''
-      saveSettings(settings)
-
-      if (!settings.endpoint || !settings.username || !settings.password) { alert('接口/账号信息不完整'); return }
-
-      const raw = ctx.getEditorValue()
-      const { data: fm, body, had } = parseFrontmatter(raw)
-      const k = { title: 'title', slug: 'slug', tags: 'tags', categories: 'categories', draft: 'draft', cid: 'cid', dateCreated: 'dateCreated' }
-
-      const preset = {
-        title: (fm[k.title] || '').toString() || '未命名文档',
-        slug: (fm[k.slug] || '').toString(),
-        tags: Array.isArray(fm[k.tags]) ? fm[k.tags] : parseListInput(fm[k.tags] || ''),
-        categories: Array.isArray(fm[k.categories]) ? fm[k.categories] : parseListInput(fm[k.categories] || ''),
-        draft: !!fm[k.draft],
-        dateCreated: fm[k.dateCreated] ? new Date(String(fm[k.dateCreated])) : new Date(),
-        cid: fm[k.cid] ? String(fm[k.cid]) : ''
-      }
-
-      // Ask missing publish inputs (minimal flow)
-      const title = prompt('标题', preset.title) || preset.title
-      let slug = prompt('Slug (可留空)', preset.slug || '') || ''
-      const tagsStr = prompt('标签 (逗号分隔)', preset.tags.join(', ')) || ''
-      const catsStr = prompt('分类 (逗号分隔，至少 1 个)', preset.categories.join(', ')) || ''
-      if (!catsStr.trim()) { alert('分类不能为空'); return }
-      const draftAns = prompt('草稿? 输入 yes/no', preset.draft ? 'yes' : 'no') || (preset.draft ? 'yes' : 'no')
-      const draft = /^y(es)?$/i.test(draftAns)
-      const useCurAns = prompt('使用当前时间作为发布时间? 输入 yes/no', 'yes') || 'yes'
-      const useCurrentTime = /^y(es)?$/i.test(useCurAns)
-      const offsetStr = prompt('发布时间偏移（小时，可为负，默认 0）', '0') || '0'
-      const offset = parseFloat(offsetStr) || 0
-
-      let postDate = useCurrentTime ? new Date() : (preset.dateCreated || new Date())
-      if (offset) postDate = new Date(postDate.getTime() + offset * 3600 * 1000)
-
-      const postStruct = {
-        title,
-        description: body,
-        mt_keywords: parseListInput(tagsStr).join(','),
-        categories: parseListInput(catsStr),
-        post_type: 'post',
-        wp_slug: slug || '',
-        mt_allow_comments: 1,
-        dateCreated: postDate,
-      }
-
-      const hasCid = !!preset.cid
-      const method = hasCid ? 'metaWeblog.editPost' : 'metaWeblog.newPost'
-      const params = hasCid
-        ? [ String(preset.cid), settings.username, settings.password, postStruct, !draft ]
-        : [ String(settings.blogId || '0'), settings.username, settings.password, postStruct, !draft ]
-
-      const xml = xmlBuildCall(method, params)
-      const result = await xmlRpcPost(settings.endpoint, xml, settings.proxyUrl)
-
-      if (!hasCid) {
-        const newCid = String(result)
-        // Write back frontmatter
-        const updated = Object.assign({}, fm)
-        updated[k.title] = title
-        updated[k.tags] = parseListInput(tagsStr)
-        updated[k.categories] = parseListInput(catsStr)
-        updated[k.draft] = draft
-        updated[k.dateCreated] = iso8601(postDate)
-        updated[k.cid] = newCid
-        if (!slug) slug = newCid
-        updated[k.slug] = slug
-        const newDoc = rebuildDoc(updated, body)
-        ctx.setEditorValue(newDoc)
-        alert(`发布成功 (cid=${newCid})`)
-      } else {
-        const updated = Object.assign({}, fm)
-        updated[k.title] = title
-        updated[k.tags] = parseListInput(tagsStr)
-        updated[k.categories] = parseListInput(catsStr)
-        updated[k.draft] = draft
-        updated[k.dateCreated] = iso8601(postDate)
-        updated[k.slug] = slug
-        const newDoc = rebuildDoc(updated, body)
-        ctx.setEditorValue(newDoc)
-        alert('更新成功')
-      }
-    } catch (e) {
-      console.error(e)
-      alert('发布失败: ' + (e?.message || String(e)))
-    }
-  } })
+  // Add menu entry to open the publish dialog
+  ctx.addMenuItem({ label: '发布到 Typecho', title: '将当前文档发布到 Typecho (XML-RPC)', onClick: async () => { await openPublishDialog(ctx) } })
 }
 
 export function deactivate() {}
-
