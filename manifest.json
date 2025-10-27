@@ -1,0 +1,9 @@
+{
+  "id": "typecho-publisher-flymd",
+  "name": "Typecho Publisher (flymd)",
+  "version": "0.1.0",
+  "author": "HansJack",
+  "description": "Publish current Markdown to Typecho via XML-RPC with optional CORS proxy.",
+  "main": "main.js"
+}
+
