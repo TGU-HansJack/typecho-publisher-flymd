@@ -277,7 +277,14 @@ async function xmlRpcPost(ctx, endpoint, xml, proxyUrl) {
   const http = ctx?.http
   const available = await ensureHttpAvailable(ctx)
   if (!available || !http?.fetch) {
-    throw new Error('Tauri HTTP 不可用，无法完成请求')
+    // 兜底：走后端命令，规避 plugin-http 的域名白名单限制
+    try {
+      const core = await import('@tauri-apps/api/core')
+      const text = await core.invoke('http_xmlrpc_post', { req: { url, xml } })
+      return xmlParseResponse(text)
+    } catch (e) {
+      throw new Error('Tauri HTTP 不可用，无法完成请求')
+    }
   }
   const headers = {
     'Content-Type': 'text/xml; charset=UTF-8',
@@ -294,14 +301,24 @@ async function xmlRpcPost(ctx, endpoint, xml, proxyUrl) {
   if (http.ResponseType?.Text !== undefined && options.responseType === undefined) {
     options.responseType = http.ResponseType.Text
   }
-  const resp = await http.fetch(url, options)
-  const text = await readResponseText(resp)
-  if (!responseOk(resp)) {
-    // 附带目标与代理信息，便于排查
-    const tip = `URL=${url}; endpoint=${endpoint}; proxy=${proxyUrl || ''}`
-    throw new Error(`HTTP ${resp?.status ?? 'ERR'}: ${text.slice(0, 200)}\n${tip}`)
+  try {
+    const resp = await http.fetch(url, options)
+    const text = await readResponseText(resp)
+    if (!responseOk(resp)) {
+      const tip = `URL=${url}; endpoint=${endpoint}; proxy=${proxyUrl || ''}`
+      throw new Error(`HTTP ${resp?.status ?? 'ERR'}: ${text.slice(0, 200)}\n${tip}`)
+    }
+    return xmlParseResponse(text)
+  } catch (e) {
+    // 若被 plugin-http 拦截（域名不在 scope）则回退到后端命令
+    const msg = String(e?.message || e || '')
+    if (/not allowed on the configured scope|scope/i.test(msg)) {
+      const core = await import('@tauri-apps/api/core')
+      const text = await core.invoke('http_xmlrpc_post', { req: { url, xml } })
+      return xmlParseResponse(text)
+    }
+    throw e
   }
-  return xmlParseResponse(text)
 }
 
 function parseListInput(s) {
