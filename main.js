@@ -131,8 +131,9 @@ async function ensureHttpAvailable(ctx, { silent = false } = {}) {
     httpState.checking = (async () => {
       try {
         if (ctx?.http?.available) {
+          // 由上层提供的 available() 即视为可用；避免外部网络探测导致误报不可用
           const ok = await ctx.http.available()
-          httpState.available = !!ok
+          httpState.available = (ok !== false)
           if (httpState.available) httpState.error = null
         } else {
           httpState.available = !!ctx?.http?.fetch
@@ -149,7 +150,7 @@ async function ensureHttpAvailable(ctx, { silent = false } = {}) {
   }
   const result = await httpState.checking
   if (!result && !silent) {
-    ctx?.ui?.notice?.('Tauri HTTP 不可用，请在 flymd 中启用 @tauri-apps/plugin-http', 'err', 4000)
+    ctx?.ui?.notice?.('网络层不可用：请在桌面版使用或确保已启用 @tauri-apps/plugin-http', 'err', 4000)
   }
   return !!result
 }
@@ -278,17 +279,28 @@ async function xmlRpcPost(ctx, endpoint, xml, proxyUrl) {
   if (!available || !http?.fetch) {
     throw new Error('Tauri HTTP 不可用，无法完成请求')
   }
+  const headers = {
+    'Content-Type': 'text/xml; charset=UTF-8',
+    'Accept': 'text/xml, */*;q=0.1',
+    'Cache-Control': 'no-cache',
+    'User-Agent': 'flymd-typecho-publisher/0.1'
+  }
   const options = {
     method: 'POST',
-    headers: { 'Content-Type': 'text/xml' },
+    headers,
     body: http.Body?.text ? http.Body.text(xml) : xml,
+    timeout: 20000
   }
   if (http.ResponseType?.Text !== undefined && options.responseType === undefined) {
     options.responseType = http.ResponseType.Text
   }
   const resp = await http.fetch(url, options)
   const text = await readResponseText(resp)
-  if (!responseOk(resp)) throw new Error(`HTTP ${resp?.status ?? 'ERR'}: ${text.slice(0, 200)}`)
+  if (!responseOk(resp)) {
+    // 附带目标与代理信息，便于排查
+    const tip = `URL=${url}; endpoint=${endpoint}; proxy=${proxyUrl || ''}`
+    throw new Error(`HTTP ${resp?.status ?? 'ERR'}: ${text.slice(0, 200)}\n${tip}`)
+  }
   return xmlParseResponse(text)
 }
 
