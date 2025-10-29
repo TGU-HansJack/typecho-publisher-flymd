@@ -277,10 +277,9 @@ async function xmlRpcPost(ctx, endpoint, xml, proxyUrl) {
   const http = ctx?.http
   const available = await ensureHttpAvailable(ctx)
   if (!available || !http?.fetch) {
-    // 兜底：走后端命令，规避 plugin-http 的域名白名单限制
+    // 兜底：走后端命令（由宿主注入 ctx.invoke），规避 plugin-http 域名白名单
     try {
-      const core = await import('@tauri-apps/api/core')
-      const text = await core.invoke('http_xmlrpc_post', { req: { url, xml } })
+      const text = await (ctx?.invoke ? ctx.invoke('http_xmlrpc_post', { req: { url, xml } }) : Promise.reject(new Error('invoke unavailable')))
       return xmlParseResponse(text)
     } catch (e) {
       throw new Error('Tauri HTTP 不可用，无法完成请求')
@@ -313,8 +312,7 @@ async function xmlRpcPost(ctx, endpoint, xml, proxyUrl) {
     // 若被 plugin-http 拦截（域名不在 scope）则回退到后端命令
     const msg = String(e?.message || e || '')
     if (/not allowed on the configured scope|scope/i.test(msg)) {
-      const core = await import('@tauri-apps/api/core')
-      const text = await core.invoke('http_xmlrpc_post', { req: { url, xml } })
+      const text = await (ctx?.invoke ? ctx.invoke('http_xmlrpc_post', { req: { url, xml } }) : Promise.reject(new Error('invoke unavailable')))
       return xmlParseResponse(text)
     }
     throw e
