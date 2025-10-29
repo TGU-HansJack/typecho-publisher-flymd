@@ -522,14 +522,19 @@ async function openPublishDialog(ctx) {
     const btnCancel = document.createElement('button')
     btnCancel.className = 'tp-fly-btn'
     btnCancel.textContent = '取消'
+    const btnOpenSettings = document.createElement('button')
+    btnOpenSettings.className = 'tp-fly-btn'
+    btnOpenSettings.textContent = '设置'
     const btnPublish = document.createElement('button')
     btnPublish.className = 'tp-fly-btn primary'
     btnPublish.textContent = '发布'
     actions.appendChild(btnCancel)
+    actions.appendChild(btnOpenSettings)
     actions.appendChild(btnPublish)
     bodyEl.appendChild(actions)
 
     btnCancel.addEventListener('click', close)
+    btnOpenSettings.addEventListener('click', () => { try { openSettings(ctx) } catch {} })
     btnPublish.addEventListener('click', async () => {
       const title = bodyEl.querySelector('#tp-title').value.trim() || '未命名文档'
       let slug = bodyEl.querySelector('#tp-slug').value.trim()
