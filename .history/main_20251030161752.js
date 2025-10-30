@@ -45,7 +45,7 @@ function iso8601(d) {
 }
 
 function parseFrontmatter(text) {
-  const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/)
+  const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/)  
   if (!match) return { data: {}, body: text, had: false }
   const yaml = match[1]
   const body = text.slice(match[0].length)
@@ -438,15 +438,15 @@ function openOverlay(title, contentBuilder) {
 }
 
 export async function openSettings(ctx) {
-  const defaults = { endpoint: '', proxyUrl: '', username: '', password: '', blogId: '0', useCurrentTime: true, publishTimeOffset: 0 } 
+  const defaults = { endpoint: '', proxyUrl: '', username: '', password: '', blogId: '0', useCurrentTime: true, publishTimeOffset: 0 }  
   const s = Object.assign({}, defaults, await loadSettings(ctx) || {})
   openOverlay('Typecho 发布器设置', (body, close) => {
     const wrap = document.createElement('div')
     wrap.className = 'tp-fly-grid'
     wrap.innerHTML = `
-      <label>接口 URL</label><input id="tp-endpoint" type="url" placeholder="https://your-site/action/xmlrpc.php" value="${s.endpoint || ''}">
-      <label>用户名</label><input id="tp-username" type="text" value="${s.username || ''}">
-      <label>密码</label><input id="tp-password" type="password" value="${s.password || ''}">
+      <label>接口 URL</label><input id="tp-endpoint" type="url" placeholder="https://your-site/action/xmlrpc.php" value="${s.endpoint || ''}">        
+      <label>用户名</label><input id="tp-username" type="text" value="${s.username || ''}">  
+      <label>密码</label><input id="tp-password" type="password" value="${s.password || ''}">  
       <label>默认博客ID</label><input id="tp-blogid" type="text" value="${s.blogId || '0'}">
       <label>CORS 代理</label><input id="tp-proxy" type="url" placeholder="可含 {target}" value="${s.proxyUrl || ''}">
       <div class="tp-fly-rowfull">建议优先使用桌面环境（内置原生网络层）避免 CORS；如需浏览器端使用，请配置自建代理。</div>
