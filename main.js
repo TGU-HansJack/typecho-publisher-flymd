@@ -326,10 +326,10 @@ function parseListInput(s) {
 function ensureStyle() {
   if (document.getElementById('tp-fly-style')) return
   const css = `
-  .tp-fly-overlay{position:fixed;inset:0;background:rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;z-index:90000}
+  .tp-fly-overlay{position:fixed;inset:0;background:rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;z-index:90000}  
   .tp-fly-hidden{display:none}
   .tp-fly-dialog{width:560px;max-width:calc(100% - 40px);background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:12px;box-shadow:0 12px 36px rgba(0,0,0,.2);}
-  .tp-fly-header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--border);font-weight:600;font-size:14px}
+  .tp-fly-header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--border);font-weight:600;font-size:14px}  
   .tp-fly-body{padding:12px 16px;max-height:65vh;overflow:auto}
   .tp-fly-grid{display:grid;grid-template-columns:140px 1fr;gap:10px;align-items:center}
   .tp-fly-grid label{color:var(--muted);font-size:12px}
@@ -444,9 +444,9 @@ export async function openSettings(ctx) {
     const wrap = document.createElement('div')
     wrap.className = 'tp-fly-grid'
     wrap.innerHTML = `
-      <label>接口 URL</label><input id="tp-endpoint" type="url" placeholder="https://your-site.com/xmlrpc.php" value="${s.endpoint || ''}">
-      <label>用户名</label><input id="tp-username" type="text" value="${s.username || ''}">
-      <label>密码</label><input id="tp-password" type="password" value="${s.password || ''}">
+      <label>接口 URL</label><input id="tp-endpoint" type="url" placeholder="默认 https://your-site/action/xmlrpc.php or action/xmlrpc?xxx (如果使用Typecho-XmlrpcProtector-Plugin)" value="${s.endpoint || ''}">    
+      <label>用户名</label><input id="tp-username" type="text" value="${s.username || ''}">  
+      <label>密码</label><input id="tp-password" type="password" value="${s.password || ''}">  
       <label>默认博客ID</label><input id="tp-blogid" type="text" value="${s.blogId || '0'}">
       <label>CORS 代理</label><input id="tp-proxy" type="url" placeholder="可含 {target}" value="${s.proxyUrl || ''}">
       <div class="tp-fly-rowfull">建议优先使用桌面环境（内置原生网络层）避免 CORS；如需浏览器端使用，请配置自建代理。</div>
