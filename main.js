@@ -444,7 +444,7 @@ export async function openSettings(ctx) {
     const wrap = document.createElement('div')
     wrap.className = 'tp-fly-grid'
     wrap.innerHTML = `
-      <label>接口 URL</label><input id="tp-endpoint" type="url" placeholder="默认 https://your-site/action/xmlrpc.php or action/xmlrpc?xxx (如果使用Typecho-XmlrpcProtector-Plugin)" value="${s.endpoint || ''}">    
+      <label>接口 URL</label><input id="tp-endpoint" type="url" placeholder="https://your-site/action/xmlrpc.php or action/xmlrpc?xxx" value="${s.endpoint || ''}">      
       <label>用户名</label><input id="tp-username" type="text" value="${s.username || ''}">  
       <label>密码</label><input id="tp-password" type="password" value="${s.password || ''}">  
       <label>默认博客ID</label><input id="tp-blogid" type="text" value="${s.blogId || '0'}">
