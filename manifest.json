@@ -1,7 +1,7 @@
 {
   "id": "typecho-publisher-flymd",
   "name": "Typecho发布",
-  "version": "1.4",
+  "version": "1.5",
   "author": "HansJack",
   "description": "通过可选的 CORS 代理使用 XML-RPC 将当前 Markdown 发布到 Typecho。",
   "main": "main.js"
