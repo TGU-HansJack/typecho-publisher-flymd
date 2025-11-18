@@ -325,27 +325,28 @@ function parseListInput(s) {
 
 function ensureStyle() {
   if (document.getElementById('tp-fly-style')) return
-  const css = `
-  .tp-fly-overlay{position:fixed;inset:0;background:rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;z-index:90000}  
-  .tp-fly-hidden{display:none}
-  .tp-fly-dialog{width:560px;max-width:calc(100% - 40px);background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:12px;box-shadow:0 12px 36px rgba(0,0,0,.2);}
-  .tp-fly-header{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border);font-weight:600;font-size:16px}  
-  .tp-fly-body{padding:24px 30px;max-height:65vh;overflow:auto}
-  .tp-fly-grid{display:grid;grid-template-columns:120px 1fr;gap:18px;align-items:start;margin-bottom:18px}
-  .tp-fly-grid label{color:var(--muted);font-size:14px;font-weight:500;padding-top:8px}
-  .tp-fly-grid input[type="text"],.tp-fly-grid input[type="password"],.tp-fly-grid input[type="url"],.tp-fly-grid input[type="datetime-local"]{width:100%;padding:12px 14px;border:1px solid var(--border);background:var(--bg);color:var(--fg);border-radius:8px;outline:none;font-size:14px;min-width:0;box-sizing:border-box}
-  .tp-fly-grid input[type="checkbox"]{transform: scale(1.2);margin: 16px 0}
-  .tp-fly-actions{display:flex;justify-content:flex-end;gap:14px;margin-top:24px;padding-top:20px;border-top:1px solid var(--border)}
-  .tp-fly-btn{cursor:pointer;border:1px solid var(--border);background:rgba(127,127,127,.08);color:var(--fg);border-radius:8px;padding:10px 20px;font-size:14px;transition:all 0.2s}
-  .tp-fly-btn.primary{border-color:#2563eb;background:#2563eb;color:#fff}
-  .tp-fly-btn:hover{background:rgba(127,127,127,.14)}
-  .tp-fly-btn.primary:hover{background:#1d4ed8;border-color:#1d4ed8}
-  .tp-fly-rowfull{grid-column:1/-1;color:var(--muted);font-size:13px;padding:16px 20px;line-height:1.6;background-color:rgba(127,127,127,.05);border-radius:8px;margin:12px 0;border:1px solid rgba(127,127,127,.1)}
-  .tp-fly-headbar{display:flex;align-items:center;gap:12px;margin:0 16px 0 12px;-webkit-appregion:no-drag}
-  .tp-fly-head-btn{cursor:pointer;border:1px solid var(--border);background:rgba(127,127,127,.08);color:var(--fg);border-radius:8px;padding:6px 12px;font-size:13px;transition:all 0.2s}
-  .tp-fly-head-btn.primary{border-color:#2563eb;background:#2563eb;color:#fff}
-  .tp-fly-head-btn:hover{background:rgba(127,127,127,.14)}
-  `
+  const css = [
+    '.tp-fly-overlay{position:fixed;inset:0;background:rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;z-index:90000}',
+    '.tp-fly-hidden{display:none}',
+    '.tp-fly-dialog{width:560px;max-width:calc(100% - 40px);background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:12px;box-shadow:0 12px 36px rgba(0,0,0,.2);overflow:hidden}',
+    '.tp-fly-header{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border);font-weight:600;font-size:16px}',
+    '.tp-fly-body{padding:0;max-height:65vh;overflow:auto}',
+    '.tp-fly-form{padding:24px 30px}',
+    '.tp-fly-grid{display:grid;grid-template-columns:120px 1fr;gap:18px;align-items:start;margin-bottom:18px}',
+    '.tp-fly-grid label{color:var(--muted);font-size:14px;font-weight:500;padding-top:8px}',
+    '.tp-fly-grid input[type="text"],.tp-fly-grid input[type="password"],.tp-fly-grid input[type="url"],.tp-fly-grid input[type="datetime-local"]{width:100%;padding:12px 14px;border:1px solid var(--border);background:var(--bg);color:var(--fg);border-radius:8px;outline:none;font-size:14px;min-width:0;box-sizing:border-box}',
+    '.tp-fly-grid input[type="checkbox"]{transform: scale(1.2);margin: 16px 0}',
+    '.tp-fly-actions{display:flex;justify-content:flex-end;gap:14px;margin-top:24px;padding-top:20px;border-top:1px solid var(--border)}',
+    '.tp-fly-btn{cursor:pointer;border:1px solid var(--border);background:rgba(127,127,127,.08);color:var(--fg);border-radius:8px;padding:10px 20px;font-size:14px;transition:all 0.2s}',
+    '.tp-fly-btn.primary{border-color:#2563eb;background:#2563eb;color:#fff}',
+    '.tp-fly-btn:hover{background:rgba(127,127,127,.14)}',
+    '.tp-fly-btn.primary:hover{background:#1d4ed8;border-color:#1d4ed8}',
+    '.tp-fly-rowfull{grid-column:1/-1;color:var(--muted);font-size:13px;padding:16px 20px;line-height:1.6;background-color:rgba(127,127,127,.05);border-radius:8px;margin:12px 0;border:1px solid rgba(127,127,127,.1)}',
+    '.tp-fly-headbar{display:flex;align-items:center;gap:12px;margin:0 16px 0 12px;-webkit-appregion:no-drag}',
+    '.tp-fly-head-btn{cursor:pointer;border:1px solid var(--border);background:rgba(127,127,127,.08);color:var(--fg);border-radius:8px;padding:6px 12px;font-size:13px;transition:all 0.2s}',
+    '.tp-fly-head-btn.primary{border-color:#2563eb;background:#2563eb;color:#fff}',
+    '.tp-fly-head-btn:hover{background:rgba(127,127,127,.14)}',
+  ].join('\n')
   const style = document.createElement('style')
   style.id = 'tp-fly-style'
   style.textContent = css
@@ -444,6 +445,8 @@ export async function openSettings(ctx) {
   const defaults = { endpoint: '', proxyUrl: '', username: '', password: '', blogId: '0', useCurrentTime: true, publishTimeOffset: 0 } 
   const s = Object.assign({}, defaults, await loadSettings(ctx) || {})
   openOverlay('Typecho 发布器设置', (body, close) => {
+    const form = document.createElement('div')
+    form.className = 'tp-fly-form'
     const wrap = document.createElement('div')
     wrap.className = 'tp-fly-grid'
     wrap.innerHTML = `
@@ -456,7 +459,8 @@ export async function openSettings(ctx) {
       <label>使用当前时间</label><input id="tp-usecur" type="checkbox" ${s.useCurrentTime ? 'checked' : ''}>
       <label>发布时间偏移(小时)</label><input id="tp-offset" type="text" value="${s.publishTimeOffset || 0}">
     `
-    body.appendChild(wrap)
+    form.appendChild(wrap)
+    body.appendChild(form)
     const actions = document.createElement('div')
     actions.className = 'tp-fly-actions'
     const btnTest = document.createElement('button')
