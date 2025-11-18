@@ -339,7 +339,7 @@ function ensureStyle() {
   .tp-fly-btn.primary{border-color:#2563eb;background:#2563eb;color:#fff}
   .tp-fly-btn:hover{background:rgba(127,127,127,.14)}
   .tp-fly-btn.primary:hover{background:#1d4ed8;border-color:#1d4ed8}
-  .tp-fly-rowfull{grid-column:1/-1;color:var(--muted);font-size:13px;padding:8px 0;line-height:1.5}
+  .tp-fly-rowfull{grid-column:1/-1;color:var(--muted);font-size:13px;padding:12px 8px;line-height:1.5;background-color:rgba(127,127,127,.05);border-radius:6px;margin:8px 0}
   .tp-fly-headbar{display:flex;align-items:center;gap:12px;margin:0 16px 0 12px;-webkit-appregion:no-drag}
   .tp-fly-head-btn{cursor:pointer;border:1px solid var(--border);background:rgba(127,127,127,.08);color:var(--fg);border-radius:8px;padding:6px 12px;font-size:13px;transition:all 0.2s}
   .tp-fly-head-btn.primary{border-color:#2563eb;background:#2563eb;color:#fff}
